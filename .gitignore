@@ -1,0 +1,11 @@
+build/
+*.o
+*.a
+tsh_server
+tsh_client
+tsh_security_audit.log
+tsh_zk_audit.ledger
+.next/
+node_modules/
+dist/
+.DS_Store
