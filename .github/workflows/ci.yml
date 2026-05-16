@@ -1,0 +1,29 @@
+name: TinyShell CI
+on: [push, pull_request]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libgrpc++-dev \
+            protobuf-compiler-grpc libseccomp-dev
+      - name: Build (Release)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+      - name: Build (ASAN+UBSAN)
+        run: |
+          cmake -B build_san \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined" \
+            -DTSH_SANITIZER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build_san --parallel
+      - name: Run tests
+        run: |
+          cd build && ctest --output-on-failure
+      - name: Run sanitizer tests
+        run: |
+          cd build_san && ctest --output-on-failure
