@@ -1,0 +1,1047 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TinyShell — Runtime Data-Flow Bug Report</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --bg:        #07090f;
+  --surface:   #0d1018;
+  --surface2:  #121620;
+  --border:    #1c2233;
+  --border2:   #263046;
+  --text:      #c8d4e8;
+  --dim:       #4a5570;
+  --dim2:      #6a7590;
+  --accent:    #3b82f6;
+  --accent2:   #60a5fa;
+  --green:     #22d37a;
+  --red:       #f04055;
+  --yellow:    #f5c842;
+  --orange:    #fb923c;
+  --purple:    #a78bfa;
+  --mono:      'IBM Plex Mono', monospace;
+  --sans:      'IBM Plex Sans', system-ui, sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+/* ── Top Bar ── */
+.topbar {
+  position: sticky; top: 0; z-index: 100;
+  background: rgba(7, 9, 15, 0.92);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  padding: 0 32px;
+  display: flex; align-items: center; gap: 18px;
+  height: 52px;
+}
+.topbar-logo { font-family: var(--mono); font-weight: 600; font-size: 14px; color: var(--accent2); letter-spacing: 0.5px; }
+.topbar-title { color: var(--dim2); font-size: 13px; }
+.topbar-spacer { flex: 1; }
+.badge { font-family: var(--mono); font-size: 10px; padding: 3px 10px; border-radius: 3px; border: 1px solid; }
+.badge-crit { border-color: var(--red);    color: var(--red);    background: rgba(240,64,85,0.08); }
+.badge-high { border-color: var(--yellow); color: var(--yellow); background: rgba(245,200,66,0.08); }
+.badge-med  { border-color: var(--purple); color: var(--purple); background: rgba(167,139,250,0.08); }
+
+/* ── Layout ── */
+.layout { display: grid; grid-template-columns: 240px 1fr; min-height: calc(100vh - 52px); }
+
+/* ── Sidebar ── */
+.sidebar {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 24px 0;
+  position: sticky; top: 52px; height: calc(100vh - 52px);
+  overflow-y: auto;
+}
+.sidebar::-webkit-scrollbar { width: 4px; }
+.sidebar::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+.nav-section { font-size: 9px; font-weight: 700; letter-spacing: 2px; color: var(--dim); padding: 16px 20px 6px; text-transform: uppercase; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 20px; cursor: pointer; border: none; background: none;
+  width: 100%; text-align: left;
+  font-size: 12.5px; font-family: var(--sans);
+  color: var(--dim2); border-left: 2px solid transparent;
+  transition: all 0.12s;
+}
+.nav-item:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+.nav-item.active { color: var(--accent2); border-left-color: var(--accent); background: rgba(59,130,246,0.07); }
+.nav-item .sev { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.sev-c { background: var(--red);    box-shadow: 0 0 6px var(--red); }
+.sev-h { background: var(--yellow); box-shadow: 0 0 5px var(--yellow); }
+.sev-m { background: var(--purple); }
+
+/* ── Content ── */
+.content { padding: 36px 48px; max-width: 1100px; }
+
+/* ── Section ── */
+.page-header { margin-bottom: 32px; }
+.page-header h1 { font-size: 26px; font-weight: 700; color: #e8edf8; margin-bottom: 6px; letter-spacing: -0.3px; }
+.page-header p  { color: var(--dim2); font-size: 13px; }
+
+.section { margin-bottom: 36px; }
+.section-label {
+  font-size: 9px; font-weight: 700; letter-spacing: 2px;
+  color: var(--dim); text-transform: uppercase;
+  padding-bottom: 10px; margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Stat Cards ── */
+.stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 18px;
+}
+.stat-card .sv { font-family: var(--mono); font-size: 28px; font-weight: 600; margin-bottom: 2px; }
+.stat-card .sl { font-size: 10px; color: var(--dim2); text-transform: uppercase; letter-spacing: 0.8px; }
+.sv-red { color: var(--red); }
+.sv-yellow { color: var(--yellow); }
+.sv-blue { color: var(--accent2); }
+.sv-purple { color: var(--purple); }
+
+/* ── Data Flow ── */
+.flow-container { overflow-x: auto; padding-bottom: 8px; margin-bottom: 24px; }
+.flow { display: flex; align-items: center; gap: 0; min-width: max-content; }
+.flow-node {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 14px;
+  min-width: 130px;
+}
+.flow-node.ok     { border-color: #1a4a30; background: rgba(34,211,122,0.05); }
+.flow-node.warn   { border-color: #3d3210; background: rgba(245,200,66,0.05); }
+.flow-node.broken { border-color: #4a1520; background: rgba(240,64,85,0.06); }
+.fn-layer { font-size: 9px; font-weight: 700; color: var(--dim); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 4px; }
+.fn-name  { font-family: var(--mono); font-size: 11px; color: var(--text); }
+.fn-status { font-size: 10px; margin-top: 4px; }
+.fn-ok { color: var(--green); }
+.fn-warn { color: var(--yellow); }
+.fn-err { color: var(--red); }
+.arrow { padding: 0 8px; font-size: 18px; flex-shrink: 0; }
+.arrow-ok { color: var(--green); }
+.arrow-broken { color: var(--red); }
+
+/* ── Bug Cards ── */
+.bug-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 14px;
+  overflow: hidden;
+}
+.bug-header {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 14px 18px;
+  cursor: pointer;
+  user-select: none;
+}
+.bug-card.open .bug-header { border-bottom: 1px solid var(--border); }
+.sev-tag {
+  font-size: 9px; font-weight: 700;
+  padding: 3px 8px; border-radius: 3px;
+  text-transform: uppercase; letter-spacing: 0.5px;
+  flex-shrink: 0; margin-top: 1px;
+}
+.tag-crit { background: rgba(240,64,85,0.18);    color: var(--red); }
+.tag-high { background: rgba(245,200,66,0.15);   color: var(--yellow); }
+.tag-med  { background: rgba(167,139,250,0.15);  color: var(--purple); }
+.bug-title { font-size: 13.5px; font-weight: 600; color: #dde4f5; flex: 1; line-height: 1.4; }
+.bug-file  { font-family: var(--mono); font-size: 10px; color: var(--dim2); flex-shrink: 0; margin-top: 2px; }
+.chevron { color: var(--dim); font-size: 10px; flex-shrink: 0; margin-top: 3px; transition: transform 0.15s; }
+.bug-card.open .chevron { transform: rotate(90deg); }
+.bug-body { display: none; padding: 18px 20px; }
+.bug-card.open .bug-body { display: block; }
+
+.desc { color: #9aabb8; font-size: 13px; line-height: 1.75; margin-bottom: 14px; }
+
+/* ── Code blocks ── */
+.code-wrap { margin: 12px 0; }
+.code-label { font-size: 9px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 6px; }
+.code-label.bad { color: var(--red); }
+.code-label.fix { color: var(--green); }
+.code-label.neu { color: var(--dim2); }
+.code {
+  background: #050709;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 12px 16px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.75;
+  color: #7a8fa8;
+  overflow-x: auto;
+  white-space: pre;
+}
+.code .del  { color: #e05870; text-decoration: line-through; }
+.code .add  { color: #4ade80; }
+.code .cmt  { color: var(--dim); }
+.code .kw   { color: var(--accent2); }
+.code .str  { color: #f5c842; }
+.code .fn   { color: #c084fc; }
+.code .lit  { color: var(--orange); }
+
+/* ── Impact Tag ── */
+.impact-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.impact-tag { font-size: 10px; padding: 2px 8px; border-radius: 3px; }
+.it-gui    { background: rgba(59,130,246,0.12);  color: var(--accent2); }
+.it-server { background: rgba(251,146,60,0.12);  color: var(--orange); }
+.it-grpc   { background: rgba(167,139,250,0.12); color: var(--purple); }
+.it-env    { background: rgba(245,200,66,0.12);  color: var(--yellow); }
+.it-data   { background: rgba(240,64,85,0.12);   color: var(--red); }
+
+/* ── Table ── */
+.bug-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.bug-table th { font-size: 9px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--dim); text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.bug-table td { padding: 9px 10px; border-bottom: 1px solid rgba(255,255,255,0.03); vertical-align: top; }
+.bug-table tr:last-child td { border-bottom: none; }
+.bug-table tr:hover td { background: rgba(255,255,255,0.015); }
+.bnum { font-family: var(--mono); font-weight: 700; color: var(--dim2); }
+.bnum-c { color: var(--red); }
+.bnum-h { color: var(--yellow); }
+.bnum-m { color: var(--purple); }
+.file-tag { font-family: var(--mono); font-size: 10px; color: var(--dim2); }
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-logo">TSH // BUG REPORT</div>
+  <div class="topbar-title">Runtime Data-Flow Audit — TinyShell Source</div>
+  <div class="topbar-spacer"></div>
+  <div class="badge badge-crit">5 CRITICAL</div>
+  <div class="badge badge-high">4 HIGH</div>
+  <div class="badge badge-med">3 MEDIUM</div>
+</div>
+
+<div class="layout">
+  <!-- Sidebar -->
+  <nav class="sidebar">
+    <div class="nav-section">Overview</div>
+    <button class="nav-item active" onclick="show('overview')">◈ Summary</button>
+    <button class="nav-item" onclick="show('dataflow')">⇒ Data Flow Map</button>
+    <button class="nav-item" onclick="show('checklist')">✓ Fix Checklist</button>
+
+    <div class="nav-section">Critical Bugs</div>
+    <button class="nav-item" onclick="show('b1')"><span class="sev sev-c"></span>B1 — Wrong Startup Page</button>
+    <button class="nav-item" onclick="show('b2')"><span class="sev sev-c"></span>B2 — No jobCompleted Signal</button>
+    <button class="nav-item" onclick="show('b3')"><span class="sev sev-c"></span>B3 — Dead gRPC Client</button>
+    <button class="nav-item" onclick="show('b4')"><span class="sev sev-c"></span>B4 — TenantWidget No API</button>
+    <button class="nav-item" onclick="show('b5')"><span class="sev sev-c"></span>B5 — Missing Env Var</button>
+
+    <div class="nav-section">High Bugs</div>
+    <button class="nav-item" onclick="show('b6')"><span class="sev sev-h"></span>B6 — Insecure gRPC Bridge</button>
+    <button class="nav-item" onclick="show('b7')"><span class="sev sev-h"></span>B7 — Spine Metrics Zero</button>
+    <button class="nav-item" onclick="show('b8')"><span class="sev sev-h"></span>B8 — Wrong Event Key</button>
+    <button class="nav-item" onclick="show('b9')"><span class="sev sev-h"></span>B9 — gRPC No Reconnect</button>
+
+    <div class="nav-section">Medium Bugs</div>
+    <button class="nav-item" onclick="show('b10')"><span class="sev sev-m"></span>B10 — Command Correlation</button>
+    <button class="nav-item" onclick="show('b11')"><span class="sev sev-m"></span>B11 — Full Poll No Sequence</button>
+    <button class="nav-item" onclick="show('b12')"><span class="sev sev-m"></span>B12 — .env Placeholder</button>
+  </nav>
+
+  <!-- Content -->
+  <main class="content">
+
+    <!-- OVERVIEW -->
+    <div id="pg-overview">
+      <div class="page-header">
+        <h1>TinyShell Runtime Data-Flow Audit</h1>
+        <p>Source-level analysis of all silent data drops — what lives in memory but never reaches the screen</p>
+      </div>
+
+      <div class="stat-row">
+        <div class="stat-card">
+          <div class="sv sv-red">5</div>
+          <div class="sl">Critical — nothing works without these</div>
+        </div>
+        <div class="stat-card">
+          <div class="sv sv-yellow">4</div>
+          <div class="sl">High — data silently lost</div>
+        </div>
+        <div class="stat-card">
+          <div class="sv sv-purple">3</div>
+          <div class="sl">Medium — correctness bugs</div>
+        </div>
+        <div class="stat-card">
+          <div class="sv sv-blue">12</div>
+          <div class="sl">Total bugs — all with exact fixes</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-label">The Core Problem</div>
+        <p class="desc">The system is built on a sound architecture — gRPC spine, event bus, HTTP API, Qt GUI — but the plumbing between layers is broken in 12 places. Data is produced correctly at the source but silently dropped before it reaches the screen. The most damaging bugs: (1) the server process never gets the spine address so all gRPC events are swallowed at the bridge, (2) a dead gRPC client in the server event-stream widget means spine events never reach the server GUI even if the bridge were fixed, (3) completing a command never triggers a dashboard refresh, (4) the tenant page uses hardcoded fake data and has no API wiring, and (5) the app starts on the wrong page.</p>
+      </div>
+
+      <div class="section">
+        <div class="section-label">What Actually Works vs. What Doesn't</div>
+        <table class="bug-table">
+          <thead><tr><th>Component</th><th>Status</th><th>Root Cause</th></tr></thead>
+          <tbody>
+            <tr><td>Client GUI → Spine gRPC submit</td><td style="color:var(--green)">✓ Works</td><td>GrpcJobClient.submit() wired correctly in LiveJobWidget</td></tr>
+            <tr><td>LiveJobWidget displays job output</td><td style="color:var(--green)">✓ Works</td><td>eventReceived signal connected to onEvent slot</td></tr>
+            <tr><td>HTTP /exec path + metrics</td><td style="color:var(--green)">✓ Works</td><td>metrics_.record_command() called synchronously</td></tr>
+            <tr><td>App startup page</td><td style="color:var(--red)">✗ Wrong page</td><td>navigate(0) = Execution tab, not Dashboard — B1</td></tr>
+            <tr><td>Dashboard refresh after command</td><td style="color:var(--red)">✗ Never</td><td>No jobCompleted signal in LiveJobWidget — B2</td></tr>
+            <tr><td>Server GUI Live Events (spine jobs)</td><td style="color:var(--red)">✗ Always empty</td><td>Dead GrpcJobClient never calls submit() — B3, and TSH_SPINE_CONTROL_ADDR not set — B5</td></tr>
+            <tr><td>Tenant management page</td><td style="color:var(--yellow)">⚠ Fake data</td><td>new TenantWidget(m_stack) — no ApiClient, only seedData() — B4</td></tr>
+            <tr><td>Spine metrics counter</td><td style="color:var(--red)">✗ Always 0</td><td>record_command() not called for async spine path — B7</td></tr>
+            <tr><td>Worker Node Dashboard</td><td style="color:var(--red)">✗ Always empty</td><td>Polls /control/events but looks for "workers" key — B8</td></tr>
+            <tr><td>Client Connection Panel</td><td style="color:var(--yellow)">⚠ Derived</td><td>Infers clients from event logs, no real session endpoint</td></tr>
+            <tr><td>SpineEventBridge in prod TLS</td><td style="color:var(--red)">✗ Silent fail</td><td>Hardcodes InsecureChannelCredentials — B6</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- DATA FLOW -->
+    <div id="pg-dataflow" style="display:none">
+      <div class="page-header">
+        <h1>Runtime Data Flow Map</h1>
+        <p>Exact trace of where data is produced and where each pipe is cut</p>
+      </div>
+
+      <div class="section">
+        <div class="section-label">Primary Path: gRPC Spine Command Execution</div>
+        <div class="flow-container">
+          <div class="flow">
+            <div class="flow-node ok">
+              <div class="fn-layer">Client</div>
+              <div class="fn-name">LiveJobWidget</div>
+              <div class="fn-status fn-ok">✓ submit() → gRPC</div>
+            </div>
+            <div class="arrow arrow-ok">→</div>
+            <div class="flow-node ok">
+              <div class="fn-layer">Spine</div>
+              <div class="fn-name">SpineServer</div>
+              <div class="fn-status fn-ok">✓ Validates, assigns</div>
+            </div>
+            <div class="arrow arrow-ok">→</div>
+            <div class="flow-node ok">
+              <div class="fn-layer">Agent</div>
+              <div class="fn-name">SpineAgent</div>
+              <div class="fn-status fn-ok">✓ Executes, streams</div>
+            </div>
+            <div class="arrow arrow-ok">→</div>
+            <div class="flow-node ok">
+              <div class="fn-layer">GUI Stream</div>
+              <div class="fn-name">LiveJobWidget</div>
+              <div class="fn-status fn-ok">✓ Output displayed</div>
+            </div>
+            <div class="arrow arrow-broken">⇢</div>
+            <div class="flow-node broken">
+              <div class="fn-layer">Dashboard</div>
+              <div class="fn-name">DashboardWidget</div>
+              <div class="fn-status fn-err">✗ Never notified [B2]</div>
+            </div>
+          </div>
+        </div>
+        <div class="flow-container">
+          <div class="flow">
+            <div class="flow-node ok">
+              <div class="fn-layer">Spine Agent</div>
+              <div class="fn-name">bus_.publish()</div>
+              <div class="fn-status fn-ok">✓ Events in bus</div>
+            </div>
+            <div class="arrow arrow-broken">⇢</div>
+            <div class="flow-node broken">
+              <div class="fn-layer">Server Bridge</div>
+              <div class="fn-name">SpineEventBridge</div>
+              <div class="fn-status fn-err">✗ stub_=null [B5]</div>
+            </div>
+            <div class="arrow arrow-broken">⇢</div>
+            <div class="flow-node broken">
+              <div class="fn-layer">HTTP Event Bus</div>
+              <div class="fn-name">ExecutionEventBus</div>
+              <div class="fn-status fn-err">✗ 0 spine events</div>
+            </div>
+            <div class="arrow arrow-broken">⇢</div>
+            <div class="flow-node broken">
+              <div class="fn-layer">Server GUI</div>
+              <div class="fn-name">EventStreamWidget</div>
+              <div class="fn-status fn-err">✗ Dead client [B3]</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-label">Step-by-Step Trace — gRPC Path</div>
+        <table class="bug-table">
+          <thead><tr><th>#</th><th>Step</th><th>Location</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td class="bnum">1</td><td>User clicks Run</td><td class="file-tag">LiveJobWidget::submit()</td><td style="color:var(--green)">emit jobSubmitted(cmd) ✓</td></tr>
+            <tr><td class="bnum">2</td><td>GrpcJobClient::submit()</td><td class="file-tag">GrpcJobClient.h</td><td style="color:var(--green)">gRPC SubmitJob sent ✓</td></tr>
+            <tr><td class="bnum">3</td><td>SpineServer processes job</td><td class="file-tag">SpineServer.cpp</td><td style="color:var(--green)">JOB_CREATED→ASSIGNED events on bus ✓</td></tr>
+            <tr><td class="bnum">4</td><td>Agent executes, streams</td><td class="file-tag">SpineAgent.cpp</td><td style="color:var(--green)">JOB_STARTED, STDOUT, EXITED on bus ✓</td></tr>
+            <tr><td class="bnum">5</td><td>WatchJob streams to GUI</td><td class="file-tag">GrpcJobClient.h</td><td style="color:var(--green)">eventReceived signals fire ✓</td></tr>
+            <tr><td class="bnum">6</td><td>LiveJobWidget::onEvent displays output</td><td class="file-tag">LiveJobWidget.h</td><td style="color:var(--green)">stdout shown, button re-enabled ✓</td></tr>
+            <tr><td class="bnum bnum-c">7</td><td>Dashboard notified on exit?</td><td class="file-tag">LiveJobWidget.h onEvent()</td><td style="color:var(--red)">✗ No jobCompleted signal. Dashboard not notified. [B2]</td></tr>
+            <tr><td class="bnum bnum-c">8</td><td>Spine events reach server HTTP bus?</td><td class="file-tag">SpineEventBridge.h</td><td style="color:var(--red)">✗ stub_=null (no TSH_SPINE_CONTROL_ADDR). watch_job() is a no-op. [B5]</td></tr>
+            <tr><td class="bnum bnum-c">9</td><td>Server GUI shows spine events?</td><td class="file-tag">ExecutionEventStreamWidget.h</td><td style="color:var(--red)">✗ m_grpcClient never calls submit(). onSpineEvent never fires. [B3]</td></tr>
+            <tr><td class="bnum bnum-c">10</td><td>Metrics counter increments?</td><td class="file-tag">SpineEventBridge::stream_job()</td><td style="color:var(--red)">✗ record_command() only called in HTTP path. Spine jobs = 0 forever. [B7]</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- CHECKLIST -->
+    <div id="pg-checklist" style="display:none">
+      <div class="page-header">
+        <h1>Fix Checklist</h1>
+        <p>Apply in this order. The first 5 alone make data appear on screen.</p>
+      </div>
+
+      <div class="section">
+        <div class="section-label">Phase 1 — Critical: Do these first</div>
+        <table class="bug-table">
+          <thead><tr><th></th><th>Fix</th><th>File</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td class="bnum bnum-c">B1</td><td>Change <code>navigate(0)</code> → <code>navigate(1)</code></td><td class="file-tag">gui/MainWindow.h</td><td style="color:var(--green)">App opens on Dashboard</td></tr>
+            <tr><td class="bnum bnum-c">B2</td><td>Add <code>jobCompleted(bool)</code> signal, emit on JOB_EXITED, connect to <code>dash->refresh()</code></td><td class="file-tag">LiveJobWidget.h + MainWindow.h</td><td style="color:var(--green)">Dashboard updates instantly on completion</td></tr>
+            <tr><td class="bnum bnum-c">B3</td><td>Remove dead m_grpcClient from EventStreamWidget; expose <code>grpcClient()</code> on LiveJobWidget; wire in MainWindow</td><td class="file-tag">ExecutionEventStreamWidget.h + MainWindow.h</td><td style="color:var(--green)">Spine events appear in server Live Events table</td></tr>
+            <tr><td class="bnum bnum-c">B4</td><td>Add ApiClient* param to TenantWidget; add polling to <code>/control/tenants</code></td><td class="file-tag">TenantWidget.h + MainWindow.h</td><td style="color:var(--green)">Tenant page shows real data</td></tr>
+            <tr><td class="bnum bnum-c">B5</td><td>Add <code>TSH_SPINE_CONTROL_ADDR="127.0.0.1:$SPINE_CONTROL_PORT"</code> to server launch block</td><td class="file-tag">start.sh</td><td style="color:var(--green)">SpineEventBridge gets a stub; all spine events bridge to HTTP bus</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <div class="section-label">Phase 2 — High: Fix data integrity and correctness</div>
+        <table class="bug-table">
+          <thead><tr><th></th><th>Fix</th><th>File</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td class="bnum bnum-h">B6</td><td>Replace hardcoded <code>InsecureChannelCredentials</code> with <code>makeChannelCredentials()</code> helper</td><td class="file-tag">server/SpineEventBridge.h</td><td style="color:var(--yellow)">Bridge works in TLS-enabled production</td></tr>
+            <tr><td class="bnum bnum-h">B7</td><td>Pass <code>Metrics&</code> into SpineEventBridge; call <code>metrics_.record_command()</code> on JOB_EXITED</td><td class="file-tag">SpineEventBridge.h + Server.cpp</td><td style="color:var(--yellow)">Dashboard commands_ok counter reflects spine jobs</td></tr>
+            <tr><td class="bnum bnum-h">B8</td><td>WorkerNodeDashboard: poll <code>/control/workers</code> (not /control/events), or parse events correctly</td><td class="file-tag">gui/WorkerNodeDashboard.h</td><td style="color:var(--yellow)">Worker panel shows actual worker data</td></tr>
+            <tr><td class="bnum bnum-h">B9</td><td>Add reconnect loop with backoff in GrpcJobClient's thread body</td><td class="file-tag">gui/GrpcJobClient.h</td><td style="color:var(--yellow)">Events don't stop silently on stream close</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <div class="section-label">Phase 3 — Medium: Polish and robustness</div>
+        <table class="bug-table">
+          <thead><tr><th></th><th>Fix</th><th>File</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td class="bnum bnum-m">B10</td><td>Replace <code>m_lastCommand</code> with <code>QHash&lt;jobId, command&gt;</code></td><td class="file-tag">gui/ExecutionEventStreamWidget.h</td><td>No more wrong command labels on overlapping jobs</td></tr>
+            <tr><td class="bnum bnum-m">B11</td><td>Add <code>m_lastSeq</code> and <code>?since_sequence=%1</code> to ClientConnectionPanel + AuditLogPanel + JobSchedulerPanel polls</td><td class="file-tag">multiple gui/*.h</td><td>No more full-history download every second</td></tr>
+            <tr><td class="bnum bnum-m">B12</td><td>Replace <code>&lt;generate with:...&gt;</code> literals in .env with empty assignments</td><td class="file-tag">.env</td><td>start.sh token guard catches unconfigured tokens correctly</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- BUG PAGES -->
+
+    <!-- B1 -->
+    <div id="pg-b1" style="display:none">
+      <div class="page-header">
+        <h1>B1 — Wrong Startup Page</h1>
+        <p class="desc">Critical · gui/MainWindow.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc">The stacked widget is built with this order: index 0 = <code>LiveJobWidget</code> (Execution terminal), index 1 = <code>DashboardWidget</code>. At the bottom of <code>buildUi()</code>, the comment literally says <em>"Start on dashboard"</em> but calls <code>navigate(0)</code>. The user opens the application and sees a blank gRPC terminal with no data, while the dashboard is running its 5-second timer in the background unseen.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — MainWindow.h, bottom of buildUi()</div>
+          <div class="code"><span class="cmt">// Stack order: 0=LiveJobWidget, 1=DashboardWidget, 2=ServerControlPanelPage...</span>
+<span class="cmt">// Start on dashboard</span>
+<span class="del">navigate(0);</span>   <span class="cmt">← opens Execution terminal</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix</div>
+          <div class="code"><span class="add">navigate(1);</span>   <span class="cmt">← DashboardWidget is at index 1</span></div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-gui">GUI</span>
+          <span class="impact-tag it-data">UX — blank screen on launch</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B2 -->
+    <div id="pg-b2" style="display:none">
+      <div class="page-header">
+        <h1>B2 — No jobCompleted Signal — Dashboard Never Refreshes After a Command</h1>
+        <p class="desc">Critical · gui/LiveJobWidget.h + gui/MainWindow.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc">In <code>LiveJobWidget::onEvent()</code>, when a <code>JOB_EXITED</code> event arrives, the widget re-enables the Run button and updates the status label. That is all it does. There is no <code>jobCompleted</code> signal. <code>DashboardWidget</code> has a <code>refresh()</code> slot and a 5-second timer, but it is never connected to anything in <code>LiveJobWidget</code>. The user runs a command, sees the output in the execution panel, then has to wait up to 5 seconds for the dashboard to catch up — and even then the counter stays at 0 if the job ran via the spine path (see B7).</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — LiveJobWidget.h: onEvent() JOB_EXITED branch only does UI cleanup</div>
+          <div class="code">} <span class="kw">else if</span> (event.has_exit()) {
+  m_submit-><span class="fn">setEnabled</span>(<span class="lit">true</span>);
+  m_status-><span class="fn">setText</span>(
+    <span class="fn">QString</span>(<span class="str">"Exited code=%1 · %2"</span>)
+      .<span class="fn">arg</span>(event.exit().<span class="fn">exit_code</span>())
+      .<span class="fn">arg</span>(<span class="fn">QString::fromStdString</span>(event.exit().<span class="fn">reason</span>())));
+  <span class="cmt">// ← no emit. DashboardWidget not notified.</span>
+}</div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Step 1: Add signal to LiveJobWidget</div>
+          <div class="code">signals:
+  <span class="kw">void</span> jobSubmitted(<span class="kw">const</span> QString &amp;command);
+  <span class="add">void jobCompleted(bool ok);   // ADD</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Step 2: Emit in onEvent()</div>
+          <div class="code">} <span class="kw">else if</span> (event.has_exit()) {
+  m_submit-><span class="fn">setEnabled</span>(<span class="lit">true</span>);
+  m_status-><span class="fn">setText</span>(...);
+  <span class="add">emit jobCompleted(event.exit().exit_code() == 0);</span>
+}
+
+<span class="cmt">// Also in JOB_FAILED / JOB_KILLED / JOB_TIMED_OUT / JOB_LOST / JOB_REJECTED:</span>
+m_submit-><span class="fn">setEnabled</span>(<span class="lit">true</span>);
+m_status-><span class="fn">setText</span>(...);
+<span class="add">emit jobCompleted(false);</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Step 3: Wire in MainWindow::buildUi()</div>
+          <div class="code"><span class="cmt">// After the existing connect(live, &LiveJobWidget::jobSubmitted, ...):</span>
+<span class="add">connect(live, &amp;LiveJobWidget::jobCompleted,
+        dash, [dash](bool) { dash->refresh(); });</span></div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-gui">GUI</span>
+          <span class="impact-tag it-data">Dashboard stale up to 5 seconds after every command</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B3 -->
+    <div id="pg-b3" style="display:none">
+      <div class="page-header">
+        <h1>B3 — Dead GrpcJobClient in ExecutionEventStreamWidget</h1>
+        <p class="desc">Critical · gui/ExecutionEventStreamWidget.h + gui/MainWindow.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc"><code>ExecutionEventStreamWidget</code> creates its own <code>GrpcJobClient</code>, stores it as <code>m_grpcClient</code>, and connects <code>m_grpcClient->eventReceived</code> to its <code>onSpineEvent</code> slot. The problem: <code>m_grpcClient->submit()</code> is <strong>never called</strong>. A <code>GrpcJobClient</code> does nothing until <code>submit()</code> is called — that's what starts the gRPC thread and opens the WatchJob stream. So <code>onSpineEvent</code> never receives any event. The real spine events flow through <code>LiveJobWidget</code>'s own client, which is a completely separate object. The <code>onSpineEvent</code> handler is beautifully implemented but permanently unreachable.</p>
+        <p class="desc">In <code>MainWindow::buildUi()</code>, the only connection between <code>live</code> and <code>server->eventStream()</code> is <code>notifyJobSubmit(command)</code> — which only updates the command label string, not the events themselves.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — ExecutionEventStreamWidget constructor: client created, signals wired, submit() never called</div>
+          <div class="code"><span class="cmt">// ── Spine gRPC watcher ──────────────────────────────────</span>
+m_grpcClient = <span class="kw">new</span> <span class="fn">GrpcJobClient</span>(<span class="kw">this</span>);
+m_grpcClient-><span class="fn">configure</span>(...);
+<span class="fn">connect</span>(m_grpcClient, &amp;GrpcJobClient::eventReceived,
+        <span class="kw">this</span>, &amp;ExecutionEventStreamWidget::onSpineEvent);
+<span class="cmt">// ← m_grpcClient->submit() is NEVER called.
+//   No gRPC thread starts. eventReceived never fires.
+//   onSpineEvent is dead code.</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Step 1: Remove dead client from ExecutionEventStreamWidget constructor</div>
+          <div class="code"><span class="cmt">// DELETE these lines from the constructor:</span>
+<span class="del">m_grpcClient = new GrpcJobClient(this);</span>
+<span class="del">m_grpcClient->configure(...);</span>
+<span class="del">connect(m_grpcClient, &GrpcJobClient::submitted, ...);</span>
+<span class="del">connect(m_grpcClient, &GrpcJobClient::eventReceived, ...);</span>
+<span class="del">connect(m_grpcClient, &GrpcJobClient::failed, ...);</span>
+
+<span class="cmt">// DELETE member:</span>
+<span class="del">GrpcJobClient *m_grpcClient = nullptr;</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Step 2: Expose accessor on LiveJobWidget</div>
+          <div class="code"><span class="cmt">// Add to LiveJobWidget public section:</span>
+<span class="add">GrpcJobClient *grpcClient() const { return m_client; }</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Step 3: Wire the real client in MainWindow::buildUi()</div>
+          <div class="code"><span class="cmt">// After: connect(live, &LiveJobWidget::jobSubmitted, server->eventStream(),
+//               &ExecutionEventStreamWidget::notifyJobSubmit);</span>
+
+<span class="add">connect(live->grpcClient(), &amp;GrpcJobClient::eventReceived,
+        server->eventStream(), &amp;ExecutionEventStreamWidget::onSpineEvent);</span></div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-gui">GUI</span>
+          <span class="impact-tag it-grpc">gRPC</span>
+          <span class="impact-tag it-data">Server Live Events table permanently empty for spine jobs</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B4 -->
+    <div id="pg-b4" style="display:none">
+      <div class="page-header">
+        <h1>B4 — TenantWidget Has No ApiClient — Shows Only Fake Hardcoded Data</h1>
+        <p class="desc">Critical · gui/TenantWidget.h + gui/MainWindow.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc">Every other widget in <code>MainWindow::buildUi()</code> receives <code>m_api</code>: <code>DashboardWidget(m_api, ...)</code>, <code>ClusterWidget(m_api, ...)</code>, <code>JobWidget(m_api, ...)</code>, <code>RbacWidget(m_api, ...)</code>, <code>AuditWidget(m_api, ...)</code>, <code>ConfigWidget(m_api, ...)</code>. <code>TenantWidget</code> is constructed as <code>new TenantWidget(m_stack)</code> with no API client. Looking at <code>TenantWidget.h</code>, its constructor accepts only <code>QWidget* parent</code>, and the entire widget calls only <code>seedData()</code> — which hardcodes 4 fake tenants and 6 fake users into the table. The page will never show real data regardless of what the server returns.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — MainWindow.h: all widgets get m_api, TenantWidget does not</div>
+          <div class="code"><span class="kw">auto</span> *dash    = <span class="kw">new</span> <span class="fn">DashboardWidget</span>(m_api, m_stack);   <span class="cmt">// ✓</span>
+<span class="kw">auto</span> *cluster = <span class="kw">new</span> <span class="fn">ClusterWidget</span>(m_api, m_stack);     <span class="cmt">// ✓</span>
+<span class="kw">auto</span> *rbac    = <span class="kw">new</span> <span class="fn">RbacWidget</span>(m_api, m_stack);        <span class="cmt">// ✓</span>
+<span class="del">auto *tenants = new TenantWidget(m_stack);              // ✗ no m_api</span>
+<span class="kw">auto</span> *config  = <span class="kw">new</span> <span class="fn">ConfigWidget</span>(m_api, m_stack);     <span class="cmt">// ✓</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Step 1: Update MainWindow</div>
+          <div class="code"><span class="add">auto *tenants = new TenantWidget(m_api, m_stack);</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Step 2: Update TenantWidget constructor to accept ApiClient</div>
+          <div class="code"><span class="kw">explicit</span> <span class="fn">TenantWidget</span>(<span class="add">tsh::ApiClient *api,</span> QWidget *parent = <span class="kw">nullptr</span>)
+    : QWidget(parent)<span class="add">, m_api(api)</span> {
+  <span class="fn">buildUi</span>();
+  <span class="add">refresh();   // Replace seedData() with real API call</span>
+}
+
+<span class="kw">void</span> <span class="fn">refresh</span>() {
+  <span class="add">m_api->getText("/control/tenants", [this](QString body, QString err) {
+    if (!err.isEmpty()) return;
+    // parse JSON, populate m_tenantTable
+  });</span>
+}
+
+<span class="kw">private</span>:
+  <span class="add">tsh::ApiClient *m_api = nullptr;</span></div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-gui">GUI</span>
+          <span class="impact-tag it-data">Tenant page always shows fake seed data</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B5 -->
+    <div id="pg-b5" style="display:none">
+      <div class="page-header">
+        <h1>B5 — TSH_SPINE_CONTROL_ADDR Missing from Server Launch — SpineEventBridge Is Dead</h1>
+        <p class="desc">Critical · start.sh + server/Server.cpp + server/SpineEventBridge.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken — the full chain</div>
+        <p class="desc">In <code>Server.cpp</code>, <code>SpineEventBridge</code> is constructed with <code>tsh::Config::read_string("TSH_SPINE_CONTROL_ADDR", "")</code>. In <code>SpineEventBridge.h</code>, if <code>spine_addr.empty()</code>, the constructor returns immediately and <code>stub_</code> stays <code>nullptr</code>. In <code>watch_job()</code>: <code>if (!stub_) return;</code> — a silent no-op. In <code>start.sh</code>, the server launch block passes <code>TSH_SPINE_TARGET</code> (which is for the GUI) but not <code>TSH_SPINE_CONTROL_ADDR</code> (which is what the server process reads). The env var the server needs is never set. Every spine-path job is swallowed at the bridge: no events enter <code>ExecutionEventBus</code>, the server GUI Live Events shows nothing, and no metrics are recorded.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — Server.cpp: reads TSH_SPINE_CONTROL_ADDR</div>
+          <div class="code">tsh::SpineEventBridge spine_bridge(
+    &amp;event_bus, &amp;scheduler,
+    tsh::<span class="fn">Config::read_string</span>(<span class="str">"TSH_SPINE_CONTROL_ADDR"</span>, <span class="str">""</span>));
+<span class="cmt">//                                              ↑ reads this env var</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — SpineEventBridge.h: empty address → stub_ = null → all watch_job() calls no-op</div>
+          <div class="code">SpineEventBridge(..., <span class="kw">const</span> std::string &amp;spine_addr) {
+  <span class="kw">if</span> (spine_addr.empty())
+    <span class="kw">return</span>;   <span class="cmt">← exits immediately, stub_ stays nullptr</span>
+  ...
+}
+
+<span class="kw">void</span> <span class="fn">watch_job</span>(<span class="kw">const</span> std::string &amp;job_id) {
+  <span class="kw">if</span> (!stub_)
+    <span class="kw">return</span>;   <span class="cmt">← silent no-op. no log. no error.</span>
+  ...
+}</div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — start.sh: server block passes TSH_SPINE_TARGET, not TSH_SPINE_CONTROL_ADDR</div>
+          <div class="code">TSH_API_TOKEN=$API_TOKEN \
+TSH_TLS_CERT=<span class="str">"$TLS_CERT"</span> \
+TSH_TLS_KEY=<span class="str">"$TLS_KEY"</span> \
+TSH_SPINE_TARGET=<span class="str">"$SPINE_CONTROL_TARGET"</span> \   <span class="cmt">← GUI reads this, not the server</span>
+<span class="del">                                               # TSH_SPINE_CONTROL_ADDR missing ←</span>
+  <span class="str">"$BUILD_DIR/tsh_server"</span> &amp;</div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Add one line to the server launch block in start.sh</div>
+          <div class="code">TSH_API_TOKEN=$API_TOKEN \
+TSH_TLS_CERT=<span class="str">"$TLS_CERT"</span> \
+TSH_TLS_KEY=<span class="str">"$TLS_KEY"</span> \
+<span class="add">TSH_SPINE_CONTROL_ADDR="127.0.0.1:$SPINE_CONTROL_PORT" \</span>
+TSH_SPINE_TARGET=<span class="str">"$SPINE_CONTROL_TARGET"</span> \
+  <span class="str">"$BUILD_DIR/tsh_server"</span> &amp;</div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-env">Config</span>
+          <span class="impact-tag it-server">Server</span>
+          <span class="impact-tag it-grpc">gRPC Bridge</span>
+          <span class="impact-tag it-data">All spine events swallowed — server GUI permanently empty for gRPC jobs</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B6 -->
+    <div id="pg-b6" style="display:none">
+      <div class="page-header">
+        <h1>B6 — SpineEventBridge Hardcodes InsecureChannelCredentials</h1>
+        <p class="desc">High · server/SpineEventBridge.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc"><code>GrpcJobClient</code> (in the GUI) correctly reads <code>TSH_GRPC_INSECURE_DEV</code> to decide between insecure and TLS credentials. <code>SpineEventBridge</code> — the server-side component that connects the HTTP server to the spine — hardcodes <code>grpc::InsecureChannelCredentials()</code> unconditionally. In any deployment where the spine gRPC server requires TLS (i.e. production), the bridge will silently fail to connect. Combined with B5 (address not set at all in dev), the bridge is broken in every environment.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — SpineEventBridge.h</div>
+          <div class="code"><span class="kw">auto</span> channel = grpc::<span class="fn">CreateChannel</span>(
+    spine_addr,
+    <span class="del">grpc::InsecureChannelCredentials()</span>);  <span class="cmt">← always insecure</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Replace with credential helper</div>
+          <div class="code"><span class="kw">auto</span> channel = grpc::<span class="fn">CreateChannel</span>(spine_addr, <span class="add">makeChannelCredentials()</span>);
+
+<span class="kw">static</span> std::shared_ptr&lt;grpc::ChannelCredentials&gt; <span class="fn">makeChannelCredentials</span>() {
+  <span class="kw">const char</span> *ins = std::<span class="fn">getenv</span>(<span class="str">"TSH_GRPC_INSECURE_DEV"</span>);
+  <span class="kw">if</span> (ins &amp;&amp; std::string(ins) == <span class="str">"1"</span>)
+    <span class="kw">return</span> grpc::<span class="fn">InsecureChannelCredentials</span>();
+  grpc::SslCredentialsOptions opts;
+  <span class="kw">const char</span> *ca = std::<span class="fn">getenv</span>(<span class="str">"TSH_GRPC_ROOT_CA"</span>);
+  <span class="kw">if</span> (ca) {
+    std::ifstream f(ca);
+    opts.pem_root_certs = std::string(
+        std::istreambuf_iterator&lt;<span class="kw">char</span>&gt;(f), {});
+  }
+  <span class="kw">return</span> grpc::<span class="fn">SslCredentials</span>(opts);
+}</div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-grpc">gRPC</span>
+          <span class="impact-tag it-server">Server</span>
+          <span class="impact-tag it-data">Bridge silent-fails in any TLS-enabled deployment</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B7 -->
+    <div id="pg-b7" style="display:none">
+      <div class="page-header">
+        <h1>B7 — Spine-Path Executions Never Call record_command() — Metrics Always Zero</h1>
+        <p class="desc">High · server/SpineEventBridge.h + server/HttpApi.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc"><code>metrics_.record_command()</code> is called in <code>HttpApi::handle_request()</code> immediately after the synchronous <code>execution_engine_.execute()</code> returns. For spine-path jobs, execution is asynchronous — <code>spine_bridge_->watch_job()</code> spawns a thread in <code>SpineEventBridge::stream_job()</code> that streams events as they arrive. When <code>JOB_EXITED</code> arrives, <code>stream_job()</code> publishes to the event bus but never calls <code>metrics_.record_command()</code>. The dashboard's <code>Commands OK</code> counter stays at 0 for all spine-submitted jobs regardless of how many complete successfully.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — SpineEventBridge::stream_job() — terminal event published but no metrics call</div>
+          <div class="code"><span class="kw">void</span> <span class="fn">stream_job</span>(<span class="kw">const</span> std::string &amp;job_id) {
+  ...
+  <span class="kw">while</span> (running_.<span class="fn">load</span>() &amp;&amp; reader-><span class="fn">Read</span>(&amp;spine_event)) {
+    bus_-><span class="fn">publish</span>(<span class="fn">translate</span>(spine_event));
+    <span class="cmt">// ← no metrics_.record_command() called here</span>
+    <span class="cmt">// ← metrics_ reference not even available in this class</span>
+  }
+}</div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Pass Metrics reference to SpineEventBridge and record on terminal event</div>
+          <div class="code"><span class="cmt">// SpineEventBridge constructor — add Metrics* parameter:</span>
+<span class="fn">SpineEventBridge</span>(ExecutionEventBus *bus, JobScheduler *sched,
+                  <span class="add">Metrics *metrics,</span>
+                  <span class="kw">const</span> std::string &amp;spine_addr)
+  : bus_(bus), scheduler_(sched)<span class="add">, metrics_(metrics)</span> { ... }
+
+<span class="cmt">// In stream_job(), after publishing a terminal event:</span>
+<span class="kw">if</span> (spine_event.<span class="fn">type</span>() == T::JOB_EXITED &amp;&amp; metrics_) {
+  <span class="add">metrics_->record_command(true, std::chrono::milliseconds(0));</span>
+} <span class="kw">else if</span> (spine_event.<span class="fn">type</span>() == T::JOB_FAILED &amp;&amp; metrics_) {
+  <span class="add">metrics_->record_command(false, std::chrono::milliseconds(0));</span>
+}
+
+<span class="cmt">// In Server.cpp, pass &metrics to SpineEventBridge constructor</span></div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-server">Server</span>
+          <span class="impact-tag it-grpc">gRPC</span>
+          <span class="impact-tag it-data">Dashboard commands_ok counter permanently shows 0 for spine jobs</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B8 -->
+    <div id="pg-b8" style="display:none">
+      <div class="page-header">
+        <h1>B8 — WorkerNodeDashboard Polls Wrong Key from Wrong Endpoint</h1>
+        <p class="desc">High · gui/WorkerNodeDashboard.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc"><code>WorkerNodeDashboard::pollWorkers()</code> fetches <code>/control/events</code> and then looks for <code>doc.object().value("workers").toArray()</code>. The <code>/control/events</code> endpoint returns <code>{"events": [...], "next_sequence": N}</code> — it has no <code>"workers"</code> key. So <code>workers.size()</code> is always 0, the table is always empty, and the status label always shows <code>0 workers</code>. Additionally, no <code>since_sequence</code> is sent, so every poll downloads the full event history for nothing.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — WorkerNodeDashboard.h</div>
+          <div class="code"><span class="kw">void</span> <span class="fn">pollWorkers</span>() {
+  m_api-><span class="fn">getText</span>(<span class="str"><span class="del">"/control/events"</span></span>, [<span class="kw">this</span>](QString body, QString err) {
+    ...
+    <span class="kw">const auto</span> workers = doc.<span class="fn">object</span>().<span class="fn">value</span>(<span class="str"><span class="del">"workers"</span></span>).<span class="fn">toArray</span>();
+    <span class="cmt">// ↑ /control/events returns {"events":[...],"next_sequence":N}
+    //   There is no "workers" key. workers.size() is always 0.</span>
+    <span class="fn">updateWorkerTable</span>(workers);
+  });
+}</div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Poll the correct endpoint</div>
+          <div class="code"><span class="cmt">// Option A: if a /control/workers endpoint exists</span>
+m_api-><span class="fn">getText</span>(<span class="add">"/control/workers"</span>, [<span class="kw">this</span>](QString body, QString err) {
+  ...
+  <span class="kw">const auto</span> workers = doc.<span class="fn">object</span>().<span class="fn">value</span>(<span class="add">"nodes"</span>).<span class="fn">toArray</span>();
+  <span class="fn">updateWorkerTable</span>(workers);
+});
+
+<span class="cmt">// Option B: if deriving from events, look for the right key</span>
+<span class="cmt">// and add since_sequence tracking (see B11)</span></div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-gui">GUI</span>
+          <span class="impact-tag it-data">Worker Node Dashboard always shows 0 workers</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B9 -->
+    <div id="pg-b9" style="display:none">
+      <div class="page-header">
+        <h1>B9 — GrpcJobClient Has No Reconnect Logic — Stream Dies Silently</h1>
+        <p class="desc">High · gui/GrpcJobClient.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc"><code>GrpcJobClient</code> runs a single thread that calls <code>submit()</code> then streams events via <code>WatchJob</code>. When <code>reader->Read()</code> returns false — either because the job ended, the server closed the stream, or a network interruption — the thread simply exits. No reconnect. No retry. No GUI indicator. The widget appears alive (no error shown) but will receive no further events. If the spine server restarts mid-job, events are silently lost forever.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — GrpcJobClient.h: thread exits when stream closes</div>
+          <div class="code"><span class="kw">auto</span> reader = stub-><span class="fn">WatchJob</span>(&amp;watchContext, watch);
+tinyshell::v1::JobEvent event;
+<span class="kw">while</span> (!m_stop.<span class="fn">load</span>() &amp;&amp; reader-><span class="fn">Read</span>(&amp;event)) {
+  <span class="fn">emit</span> <span class="fn">eventReceived</span>(event);
+  ...
+}
+<span class="cmt">// ← thread exits here. no retry. no log. no GUI update.</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Add retry loop with exponential backoff</div>
+          <div class="code"><span class="add">int backoff_ms = 500;
+while (!m_stop.load()) {</span>
+  <span class="kw">try</span> {
+    <span class="kw">auto</span> channel = grpc::<span class="fn">CreateChannel</span>(...);
+    <span class="kw">auto</span> stub = ...;
+    <span class="cmt">// submit + watch loop</span>
+    <span class="kw">while</span> (!m_stop.<span class="fn">load</span>() &amp;&amp; reader-><span class="fn">Read</span>(&amp;event)) { ... }
+    <span class="kw">const auto</span> status = reader-><span class="fn">Finish</span>();
+    <span class="kw">if</span> (status.<span class="fn">ok</span>()) <span class="kw">break</span>;   <span class="cmt">// clean completion</span>
+    <span class="add">emit streamDisconnected();   // surface in GUI</span>
+  } <span class="kw">catch</span> (...) {}
+  <span class="add">std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+  backoff_ms = std::min(backoff_ms * 2, 16000);
+}</span></div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-grpc">gRPC</span>
+          <span class="impact-tag it-gui">GUI</span>
+          <span class="impact-tag it-data">Events stop silently on any network blip or server restart</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B10 -->
+    <div id="pg-b10" style="display:none">
+      <div class="page-header">
+        <h1>B10 — m_lastCommand Is a Race: Overlapping Jobs Get Wrong Command Labels</h1>
+        <p class="desc">Medium · gui/ExecutionEventStreamWidget.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc"><code>ExecutionEventStreamWidget</code> stores a single <code>QString m_lastCommand</code> set by <code>notifyJobSubmit()</code>. When <code>onSpineEvent()</code> adds a row, it uses <code>m_lastCommand</code> for the Command column. If two jobs are submitted before the first completes, <code>m_lastCommand</code> is overwritten to the second job's command. All subsequent events for Job A are labeled with Job B's command name. The table shows incorrect audit data.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — global mutable state shared across concurrent jobs</div>
+          <div class="code">QString m_lastCommand;   <span class="cmt">// ← single global string, overwritten on each submit</span>
+
+<span class="kw">void</span> <span class="fn">notifyJobSubmit</span>(<span class="kw">const</span> QString &amp;command) {
+  m_lastCommand = command;   <span class="cmt">// ← overwrites Job A's name when Job B submits</span>
+}
+
+<span class="kw">void</span> <span class="fn">onSpineEvent</span>(tinyshell::v1::JobEvent event) {
+  ...
+  <span class="fn">addRow</span>(ts, type, job_id, actor, m_lastCommand, state, detail);
+  <span class="cmt">//                                  ↑ wrong if two jobs overlap</span>
+}</div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Map job_id → command</div>
+          <div class="code"><span class="add">QHash&lt;QString, QString&gt; m_jobCommands;   // job_id → command</span>
+
+<span class="kw">void</span> <span class="fn">notifyJobSubmit</span>(<span class="kw">const</span> QString &amp;jobId, <span class="kw">const</span> QString &amp;command) {
+  <span class="add">m_jobCommands[jobId] = command;</span>
+}
+
+<span class="kw">void</span> <span class="fn">onSpineEvent</span>(tinyshell::v1::JobEvent event) {
+  <span class="kw">const auto</span> jobId = <span class="fn">QString::fromStdString</span>(event.<span class="fn">job_id</span>());
+  <span class="add">const auto cmd = m_jobCommands.value(jobId, "—");</span>
+  <span class="fn">addRow</span>(ts, type, jobId, actor, <span class="add">cmd</span>, state, detail);
+  <span class="cmt">// Clean up completed jobs:</span>
+  <span class="add">if (isTerminalEvent(event.type())) m_jobCommands.remove(jobId);</span>
+}</div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-gui">GUI</span>
+          <span class="impact-tag it-data">Incorrect command labels in audit table under concurrent jobs</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B11 -->
+    <div id="pg-b11" style="display:none">
+      <div class="page-header">
+        <h1>B11 — ClientConnectionPanel and AuditLogPanel Poll Full History Every Second</h1>
+        <p class="desc">Medium · gui/ClientConnectionPanel.h + gui/AuditLogPanel.h + gui/JobSchedulerPanel.h</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc"><code>ClientConnectionPanel::pollClients()</code> and other secondary panels call <code>m_api->getText("/control/events", ...)</code> without a <code>?since_sequence=N</code> parameter. Every poll downloads the entire event history (up to the bus cap of 10,000 events), parses it, and rebuilds the table from scratch. <code>ExecutionEventStreamWidget</code> (which works correctly) already has <code>m_lastHttpSeq</code> and uses <code>?since_sequence=%1</code>. These panels don't. Under load, this becomes O(n) per second and causes visible table flicker from <code>setRowCount(0)</code> + full rebuild.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — ClientConnectionPanel polls entire history</div>
+          <div class="code">m_api-><span class="fn">getText</span>(<span class="str"><span class="del">"/control/events"</span></span>, [<span class="kw">this</span>](QString body, ...) {
+  <span class="cmt">// rebuilds entire client table from scratch every second</span>
+  m_table-><span class="fn">setRowCount</span>(0);
+  ...
+});</div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — same pattern already used in ExecutionEventStreamWidget</div>
+          <div class="code"><span class="cmt">// 1. Add member:</span>
+<span class="add">quint64 m_lastSeq = 0;</span>
+
+<span class="cmt">// 2. Use since_sequence in URL:</span>
+m_api-><span class="fn">getText</span>(
+  <span class="add">QString("/control/events?since_sequence=%1").arg(m_lastSeq)</span>,
+  [<span class="kw">this</span>](QString body, ...) {
+    ...
+    <span class="cmt">// 3. Only append new events, don't rebuild:</span>
+    <span class="add">const auto nextSeq = static_cast&lt;quint64&gt;(
+        doc.object().value("next_sequence").toDouble());
+    if (nextSeq > m_lastSeq) m_lastSeq = nextSeq;</span>
+  });
+</div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-gui">GUI</span>
+          <span class="impact-tag it-server">Server</span>
+          <span class="impact-tag it-data">O(n) full download every second; table flicker; wasted bandwidth</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- B12 -->
+    <div id="pg-b12" style="display:none">
+      <div class="page-header">
+        <h1>B12 — .env Contains Literal Placeholder Strings That Bypass Token Guard</h1>
+        <p class="desc">Medium · .env</p>
+      </div>
+      <div class="section">
+        <div class="section-label">What's broken</div>
+        <p class="desc">The <code>.env</code> file contains <code>export TSH_API_TOKEN=&lt;generate with: ./generate_secrets.sh&gt;</code>. If a user sources this file as-is, <code>TSH_API_TOKEN</code> is set to the literal string <code>&lt;generate with: ./generate_secrets.sh&gt;</code>. The guard in <code>start.sh</code> checks <code>if [[ -z "$API_TOKEN" || "$API_TOKEN" == "dev-token-1234" ]]</code> — neither condition matches a non-empty non-default string. The server launches with a token that is a literal angle-bracket instruction, and every API call with a real token will fail authentication.</p>
+
+        <div class="code-wrap">
+          <div class="code-label bad">Bug — .env</div>
+          <div class="code"><span class="del">export TSH_API_TOKEN=&lt;generate with: ./generate_secrets.sh&gt;</span>
+<span class="del">export TSH_ZK_SECRET=&lt;generate with: ./generate_secrets.sh&gt;</span></div>
+        </div>
+
+        <div class="code-wrap">
+          <div class="code-label fix">Fix — Use empty assignments that the guard catches</div>
+          <div class="code"><span class="cmt"># Run: source &lt;(./generate_secrets.sh) before starting</span>
+<span class="add">export TSH_API_TOKEN=
+export TSH_ZK_SECRET=</span>
+export TSH_TLS_CERT=certs/server.crt
+export TSH_TLS_KEY=certs/server.key</div>
+        </div>
+
+        <div class="impact-row">
+          <span class="impact-tag it-env">Config</span>
+          <span class="impact-tag it-data">Server launches with unusable token; every auth request fails</span>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script>
+const PAGES = ['overview','dataflow','checklist','b1','b2','b3','b4','b5','b6','b7','b8','b9','b10','b11','b12'];
+
+function show(id) {
+  PAGES.forEach(p => {
+    const el = document.getElementById('pg-' + p);
+    if (el) el.style.display = (p === id) ? '' : 'none';
+  });
+  document.querySelectorAll('.nav-item').forEach(btn => {
+    const match = btn.getAttribute('onclick')?.includes("'" + id + "'");
+    btn.classList.toggle('active', !!match);
+  });
+}
+
+// Set default active nav
+document.querySelector('.nav-item')?.classList.add('active');
+</script>
+</body>
+</html>

@@ -16,6 +16,8 @@ int main(int argc, char *argv[]) {
       token = argv[++i];
     }
   }
+  if (token.isEmpty())
+    token = qEnvironmentVariable("TSH_API_TOKEN");
 
   auto panel = new ServerControlPanel(serverUrl, token);
   panel->show();

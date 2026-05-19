@@ -27,6 +27,6 @@ public:
   virtual void mark_agent_heartbeat(const std::string &agent_id) = 0;
 };
 
-std::unique_ptr<EventStore> make_postgres_event_store(const std::string &dsn);
+std::unique_ptr<EventStore> make_wal_event_store(const std::string &data_dir);
 
 } // namespace tsh::spine

@@ -1,23 +1,28 @@
 #pragma once
-#include <QWidget>
-#include <QTabWidget>
-#include <QVBoxLayout>
-#include <QHBoxLayout>
-#include <QTableWidget>
-#include <QHeaderView>
-#include <QLabel>
-#include <QPushButton>
-#include <QLineEdit>
-#include <QSpinBox>
-#include <QDoubleSpinBox>
+#include "ApiClient.h"
+#include "TshStyle.h"
 #include <QComboBox>
 #include <QDialog>
-#include <QFormLayout>
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QFormLayout>
+#include <QHeaderView>
+#include <QHBoxLayout>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
-#include <QUuid>
 #include <QProgressBar>
-#include "TshStyle.h"
+#include <QPushButton>
+#include <QSpinBox>
+#include <QTableWidget>
+#include <QTabWidget>
+#include <QTimer>
+#include <QWidget>
+#include <QUuid>
+#include <QVBoxLayout>
 
 // Multi-tenant management — mirrors MultiTenantManager.h data structures.
 class TenantWidget : public QWidget {
@@ -42,9 +47,92 @@ class TenantWidget : public QWidget {
     };
 
 public:
-    explicit TenantWidget(QWidget* parent = nullptr) : QWidget(parent) {
+    explicit TenantWidget(tsh::ApiClient* api, QWidget* parent = nullptr)
+        : QWidget(parent), m_api(api) {
         buildUi();
-        seedData();
+        refresh();
+
+        m_refreshTimer = new QTimer(this);
+        connect(m_refreshTimer, &QTimer::timeout, this, &TenantWidget::refresh);
+        m_refreshTimer->start(5000);
+    }
+
+private slots:
+    void refresh() {
+        if (!m_api) {
+            if (m_statusLbl) m_statusLbl->setText("No API client configured.");
+            return;
+        }
+
+        m_api->getText("/control/tenants", [this](QString body, QString err) {
+            if (!err.isEmpty()) {
+                m_statusLbl->setText("Tenant API offline: " + err);
+                return;
+            }
+
+            QJsonParseError pe;
+            const auto doc = QJsonDocument::fromJson(body.toUtf8(), &pe);
+            if (pe.error != QJsonParseError::NoError || !doc.isObject()) {
+                m_statusLbl->setText("Invalid tenant JSON.");
+                return;
+            }
+
+            const auto root = doc.object();
+            const auto tenants = root.value("tenants").toArray();
+            const auto users = root.value("users").toArray();
+
+            m_tenants.clear();
+            m_users.clear();
+            m_tenantTable->setRowCount(0);
+            m_userTable->setRowCount(0);
+            m_tenantFilter->blockSignals(true);
+            m_tenantFilter->clear();
+            m_tenantFilter->addItem("All Tenants");
+
+            for (const auto& value : tenants) {
+                const auto obj = value.toObject();
+                Tenant t;
+                t.id = obj.value("id").toString(obj.value("tenant_id").toString());
+                t.name = obj.value("name").toString(obj.value("tenant_name").toString());
+                t.owner = obj.value("owner").toString();
+                t.active = obj.contains("active")
+                               ? obj.value("active").toBool(true)
+                               : obj.value("is_active").toBool(true);
+                t.quotaJobs = obj.value("quota_jobs")
+                                  .toInt(obj.value("resource_quota_jobs").toInt(100));
+                t.quotaMemMb = obj.value("quota_memory_mb")
+                                   .toInt(obj.value("resource_quota_memory_mb").toInt(1024));
+                t.quotaCpuPct = obj.value("quota_cpu_percent")
+                                    .toDouble(obj.value("resource_quota_cpu_percent").toDouble(50.0));
+                if (t.id.isEmpty() || t.name.isEmpty())
+                    continue;
+                addTenantRow(t);
+                m_tenantFilter->addItem(t.name);
+            }
+
+            m_tenantFilter->blockSignals(false);
+
+            for (const auto& value : users) {
+                const auto obj = value.toObject();
+                TenantUser u;
+                u.userId = obj.value("id").toString(obj.value("user_id").toString());
+                u.username = obj.value("username").toString();
+                u.tenantId = obj.value("tenant_id").toString();
+                u.role = obj.value("role").toString();
+                u.active = obj.contains("active")
+                               ? obj.value("active").toBool(true)
+                               : obj.value("is_active").toBool(true);
+                if (u.userId.isEmpty() || u.username.isEmpty())
+                    continue;
+                m_users.append(u);
+                addUserRow(u);
+            }
+
+            filterUsers();
+            m_statusLbl->setText(QString("Live tenants: %1 · users: %2")
+                                     .arg(m_tenants.size())
+                                     .arg(m_users.size()));
+        });
     }
 
 private:
@@ -56,6 +144,10 @@ private:
         auto* titleLbl = new QLabel("Multi-Tenant Management", this);
         titleLbl->setStyleSheet("font-size:22px; font-weight:700; color:#e8eaf0;");
         root->addWidget(titleLbl);
+
+        m_statusLbl = new QLabel("Loading tenants...", this);
+        m_statusLbl->setStyleSheet("font-size:12px; color:#8891b0;");
+        root->addWidget(m_statusLbl);
 
         auto* tabs = new QTabWidget(this);
         root->addWidget(tabs, 1);
@@ -161,37 +253,6 @@ private:
         t->verticalHeader()->hide();
         t->setShowGrid(false);
         t->horizontalHeader()->setStretchLastSection(true);
-    }
-
-    void seedData() {
-        auto addT = [&](const QString& name, const QString& owner,
-                        int jobs, int mem, double cpu)
-        {
-            Tenant t;
-            t.id = QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
-            t.name=name; t.owner=owner;
-            t.quotaJobs=jobs; t.quotaMemMb=mem; t.quotaCpuPct=cpu;
-            addTenantRow(t);
-            m_tenantFilter->addItem(name);
-        };
-        addT("platform-eng",  "alice",  200, 4096, 80.0);
-        addT("data-science",  "bob",    100, 8192, 60.0);
-        addT("security",      "carol",   50, 1024, 30.0);
-        addT("qa-automation", "dave",   150, 2048, 50.0);
-
-        auto addU = [&](const QString& uname, const QString& tid, const QString& role){
-            TenantUser u;
-            u.userId=QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
-            u.username=uname; u.tenantId=tid; u.role=role;
-            m_users.append(u);
-            addUserRow(u);
-        };
-        addU("alice",  m_tenants[0].id, "admin");
-        addU("bob",    m_tenants[1].id, "admin");
-        addU("carol",  m_tenants[2].id, "operator");
-        addU("dave",   m_tenants[3].id, "admin");
-        addU("eve",    m_tenants[0].id, "viewer");
-        addU("frank",  m_tenants[1].id, "scheduler");
     }
 
     void addTenantRow(const Tenant& t) {
@@ -366,6 +427,9 @@ private:
     QTableWidget* m_userTable   = nullptr;
     QComboBox*    m_tenantFilter= nullptr;
     QLabel*       m_tenantInfoLbl = nullptr;
+    QLabel*       m_statusLbl = nullptr;
+    QTimer*       m_refreshTimer = nullptr;
+    tsh::ApiClient* m_api = nullptr;
     QList<Tenant>     m_tenants;
     QList<TenantUser> m_users;
 };

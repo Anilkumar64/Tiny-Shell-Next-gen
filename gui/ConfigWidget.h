@@ -213,7 +213,7 @@ private:
     m_api->setToken(m_tokenEdit->text().trimmed());
 
     m_api->getText(
-        "/health", [this, savedUrl, savedToken](QString body, QString err) {
+        "/metrics", [this, savedUrl, savedToken](QString body, QString err) {
           m_api->setBaseUrl(savedUrl);
           m_api->setToken(savedToken);
           if (!err.isEmpty()) {

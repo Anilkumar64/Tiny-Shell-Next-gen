@@ -7,6 +7,7 @@
 #include "../server/TaintTracker.h"
 #include "../server/ThreadPool.h"
 #include "../server/UnitValidator.h"
+#include "../spine/common/JobSigner.h"
 #include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
@@ -77,6 +78,13 @@ void handle_job(int client_fd) {
     if (!channel.handshake(SecureChannel::Mode::SERVER)) {
       return;
     }
+    const auto signing_key = env_string("TSH_JOB_SIGNING_KEY", "");
+    if (signing_key.empty()) {
+      send_text(channel, "ERR worker has no signing key configured",
+                SecureChannel::MsgType::AUDIT_LOG);
+      return;
+    }
+    tsh::spine::JobSigner signer("worker", signing_key);
 
     try {
       std::vector<uint8_t> payload;
@@ -88,7 +96,17 @@ void handle_job(int client_fd) {
         return;
       }
 
-      auto ast = tsh::AstSerializer::deserialize(payload);
+      tinyshell::v1::SignedJobSpec signed_spec;
+      if (!signed_spec.ParseFromArray(payload.data(), payload.size()) ||
+          !signer.verify(signed_spec)) {
+        send_text(channel, "ERR invalid job signature",
+                  SecureChannel::MsgType::AUDIT_LOG);
+        return;
+      }
+
+      const auto &cmd = signed_spec.spec().command();
+      auto ast = tsh::AstSerializer::deserialize(
+          std::vector<uint8_t>(cmd.begin(), cmd.end()));
       tsh::PipelineValidator validator;
       validator.validate(ast);
       tsh::TaintTracker::enforce_data_flow(ast);
@@ -97,7 +115,7 @@ void handle_job(int client_fd) {
       const auto started = std::chrono::steady_clock::now();
       auto output = tsh::ExecutionGuard::execute_with_timeout(
           std::chrono::milliseconds(env_int("TSH_WORKER_TIMEOUT_MS", 3000)),
-          [&]() { return tsh::Executor::execute(ast); });
+          [&]() -> std::string { return tsh::Executor::execute(ast); });
       if (!output.empty() && output.back() != '\n') {
         output.push_back('\n');
       }

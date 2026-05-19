@@ -7,17 +7,18 @@
 #include <QObject>
 #include <QString>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
-
-Q_DECLARE_METATYPE(tinyshell::v1::JobEvent)
 
 class GrpcJobClient : public QObject {
   Q_OBJECT
@@ -59,28 +60,48 @@ public:
         const auto jobId = QString::fromStdString(resp.job_id());
         emit submitted(jobId, QString::fromStdString(resp.message()));
 
-        tinyshell::v1::WatchJobRequest watch;
-        watch.set_job_id(resp.job_id());
-        grpc::ClientContext watchContext;
-        watchContext.set_deadline(std::chrono::system_clock::now() +
-                                  std::chrono::minutes(10));
-        setActiveContext(&watchContext);
-        auto reader = stub->WatchJob(&watchContext, watch);
-        tinyshell::v1::JobEvent event;
-        while (!m_stop.load() && reader->Read(&event)) {
-          emit eventReceived(event);
-          if (event.type() == tinyshell::v1::JOB_EXITED ||
-              event.type() == tinyshell::v1::JOB_FAILED ||
-              event.type() == tinyshell::v1::JOB_TIMED_OUT ||
-              event.type() == tinyshell::v1::JOB_KILLED ||
-              event.type() == tinyshell::v1::JOB_LOST ||
-              event.type() == tinyshell::v1::JOB_REJECTED) {
+        std::uint64_t lastSequence = 0;
+        int backoffMs = 500;
+        while (!m_stop.load()) {
+          tinyshell::v1::WatchJobRequest watch;
+          watch.set_job_id(resp.job_id());
+          watch.set_after_sequence(lastSequence);
+
+          grpc::ClientContext watchContext;
+          watchContext.set_deadline(std::chrono::system_clock::now() +
+                                    std::chrono::minutes(10));
+          setActiveContext(&watchContext);
+          auto reader = stub->WatchJob(&watchContext, watch);
+          tinyshell::v1::JobEvent event;
+          bool sawTerminal = false;
+          bool readAny = false;
+          while (!m_stop.load() && reader->Read(&event)) {
+            readAny = true;
+            if (event.sequence() > lastSequence) {
+              lastSequence = event.sequence();
+            }
+            emit eventReceived(event);
+            if (isTerminal(event.type())) {
+              sawTerminal = true;
+              break;
+            }
+          }
+          watchContext.TryCancel();
+          const auto watchStatus = reader->Finish();
+          setActiveContext(nullptr);
+
+          if (m_stop.load() || sawTerminal) {
             break;
           }
+          if (!watchStatus.ok()) {
+            emit streamDisconnected(
+                QString::fromStdString(watchStatus.error_message()));
+          }
+          if (readAny)
+            backoffMs = 500;
+          sleepWithStop(backoffMs);
+          backoffMs = std::min(backoffMs * 2, 16000);
         }
-        watchContext.TryCancel();
-        reader->Finish();
-        setActiveContext(nullptr);
       } catch (const std::exception &e) {
         setActiveContext(nullptr);
         emit failed(QString::fromStdString(e.what()));
@@ -104,12 +125,31 @@ public:
 signals:
   void submitted(QString jobId, QString message);
   void eventReceived(tinyshell::v1::JobEvent event);
+  void streamDisconnected(QString error);
   void failed(QString error);
 
 private:
   void setActiveContext(grpc::ClientContext *context) {
     std::lock_guard<std::mutex> lock(m_contextMutex);
     m_activeContext = context;
+  }
+
+  static bool isTerminal(tinyshell::v1::JobEventType type) {
+    return type == tinyshell::v1::JOB_EXITED ||
+           type == tinyshell::v1::JOB_FAILED ||
+           type == tinyshell::v1::JOB_TIMED_OUT ||
+           type == tinyshell::v1::JOB_KILLED ||
+           type == tinyshell::v1::JOB_LOST ||
+           type == tinyshell::v1::JOB_REJECTED;
+  }
+
+  void sleepWithStop(int totalMs) const {
+    int sleptMs = 0;
+    while (!m_stop.load() && sleptMs < totalMs) {
+      const int stepMs = std::min(100, totalMs - sleptMs);
+      std::this_thread::sleep_for(std::chrono::milliseconds(stepMs));
+      sleptMs += stepMs;
+    }
   }
 
   static std::string env(const char *name) {

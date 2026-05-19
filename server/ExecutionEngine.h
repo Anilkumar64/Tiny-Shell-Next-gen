@@ -6,6 +6,7 @@
 #include "ExecutionEventBus.h"
 #include "ExecutionTimeout.h"
 #include "IntentDrift.h"
+#include "JobScheduler.h"
 #include "Pipeline.h"
 #include "PipelineValidator.h"
 #include "RbacManager.h"
@@ -14,6 +15,7 @@
 #include "TaintTracker.h"
 #include "UnitValidator.h"
 #include "WorkerTypes.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -44,8 +46,9 @@ struct ExecutionResult {
 class ExecutionEngine {
 public:
   ExecutionEngine(ExecutionEventBus &events, std::atomic<int> &risk,
-                  std::atomic<bool> &drift)
-      : events_(events), global_risk_(risk), global_drift_(drift) {}
+                  std::atomic<bool> &drift, JobScheduler *scheduler = nullptr)
+      : events_(events), global_risk_(risk), global_drift_(drift),
+        scheduler_(scheduler) {}
 
   void set_workers(std::vector<RemoteNode> workers) {
     std::lock_guard<std::mutex> lock(worker_mutex_);
@@ -74,7 +77,8 @@ public:
     try {
       auto ast = Parser::parse_pipeline(request.command);
       if (!ast) {
-        throw ValidationException("Command is empty or outside parser allowlist");
+        throw ValidationException(
+            "Command is empty or outside parser allowlist");
       }
       emit(request, ExecutionEventType::AstParsed, "parsed",
            "Command parsed into AST");
@@ -113,8 +117,7 @@ public:
         const auto serialized = AstSerializer::serialize(ast);
         std::string streamed_output;
         const auto error = RemoteWorkerClient::execute_node_stream(
-            serialized, worker,
-            [&](const std::string &chunk, bool is_stderr) {
+            serialized, worker, [&](const std::string &chunk, bool is_stderr) {
               streamed_output += chunk;
               emit(request,
                    is_stderr ? ExecutionEventType::StderrChunk
@@ -143,13 +146,16 @@ public:
            "Execution completed", result.worker, result.output,
            result.duration_ms);
     } catch (const TaintException &e) {
-      result = fail(request, started, "taint_violation", e.what(), result.worker);
+      result =
+          fail(request, started, "taint_violation", e.what(), result.worker);
     } catch (const ValidationException &e) {
-      result = fail(request, started, "validation_failed", e.what(), result.worker);
+      result =
+          fail(request, started, "validation_failed", e.what(), result.worker);
     } catch (const TimeoutException &e) {
       result = fail(request, started, "timeout_kill", e.what(), result.worker);
     } catch (const std::exception &e) {
-      result = fail(request, started, "execution_failed", e.what(), result.worker);
+      result =
+          fail(request, started, "execution_failed", e.what(), result.worker);
     }
 
     return result;
@@ -165,11 +171,16 @@ private:
       const auto selected = workers_[next_worker_ % workers_.size()];
       ++next_worker_;
       const auto id = worker_node_id(selected);
-      const auto health = worker_health_.find(id);
-      if (health == worker_health_.end() ||
-          health->second == WorkerHealthStatus::HEALTHY ||
-          health->second == WorkerHealthStatus::DEGRADED) {
-        return selected;
+      if (scheduler_) {
+        if (scheduler_->is_node_healthy(id))
+          return selected;
+      } else {
+        const auto health = worker_health_.find(id);
+        if (health == worker_health_.end() ||
+            health->second == WorkerHealthStatus::HEALTHY ||
+            health->second == WorkerHealthStatus::DEGRADED) {
+          return selected;
+        }
       }
     }
     throw std::runtime_error("No healthy workers available");
@@ -231,6 +242,7 @@ private:
   std::unordered_map<std::string, WorkerHealthStatus> worker_health_;
   std::size_t next_worker_ = 0;
   std::mutex worker_mutex_;
+  JobScheduler *scheduler_ = nullptr;
 };
 
 } // namespace tsh

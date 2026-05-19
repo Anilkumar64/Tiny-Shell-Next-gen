@@ -1,9 +1,9 @@
 #pragma once
 #include "ApiClient.h"
-#include "GrpcJobClient.h"
 #include "tinyshell/v1/spine.pb.h"
 #include <QDateTime>
 #include <QHeaderView>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -26,73 +26,31 @@ public:
                                       QWidget *parent = nullptr)
       : QWidget(parent), m_api(api) {
     buildUI();
-
-    // ── Spine gRPC watcher ─────────────────────────────────────────────
-    // We use a dedicated GrpcJobClient wired to an internal slot so that
-    // every job event that flows through the spine also appears here.
-    m_grpcClient = new GrpcJobClient(this);
-    const QByteArray target = qgetenv("TSH_SPINE_TARGET");
-    m_grpcClient->configure(target.isEmpty() ? QStringLiteral("127.0.0.1:7443")
-                                             : QString::fromLocal8Bit(target));
-
-    connect(m_grpcClient, &GrpcJobClient::submitted, this,
-            [this](QString jobId, QString msg) {
-              addRow(QDateTime::currentDateTime().toString("hh:mm:ss.zzz"),
-                     "job_submitted", jobId.left(12), "operator", m_lastCommand,
-                     "submitted", msg);
-            });
-    connect(m_grpcClient, &GrpcJobClient::eventReceived, this,
-            &ExecutionEventStreamWidget::onSpineEvent);
-    connect(m_grpcClient, &GrpcJobClient::failed, this, [this](QString err) {
-      addRow(QDateTime::currentDateTime().toString("hh:mm:ss.zzz"),
-             "grpc_error", "-", "-", "-", "error", err);
-    });
-
     startPolling();
   }
 
   // Called by LiveJobWidget when the user submits a job, so we know the
-  // command name to display for subsequent spine events.
-  void notifyJobSubmit(const QString &command) { m_lastCommand = command; }
+  // command name to display once the spine returns the job id.
+  void notifyJobSubmit(const QString &command) { m_pendingCommandHint = command; }
 
-private slots:
-  void pollHttpEvents() {
-    // BUG: live events repolled from the beginning and appeared empty/stale.
-    // FIX: long-poll only events newer than the last received sequence.
-    m_api->getText(QString("/control/events?since_sequence=%1").arg(m_lastHttpSeq),
-                   [this](QString body, QString err) {
-      if (!err.isEmpty()) {
-        m_statusLbl->setText("⚠ HTTP stream error: " + err);
-        return;
-      }
-      QJsonParseError pe;
-      const auto doc = QJsonDocument::fromJson(body.toUtf8(), &pe);
-      if (pe.error != QJsonParseError::NoError) {
-        m_statusLbl->setText("⚠ Invalid event JSON");
-        return;
-      }
-      const auto events = doc.object().value("events").toArray();
-      // Only add HTTP events that are newer than what we've already shown.
-      int newCount = 0;
-      for (int i = 0; i < events.size(); ++i) {
-        const auto evt = events[i].toObject();
-        const auto seq = static_cast<quint64>(evt.value("sequence").toDouble());
-        if (seq > m_lastHttpSeq) {
-          m_lastHttpSeq = seq;
-          addRow(evt.value("timestamp").toString().right(12),
-                 evt.value("type").toString(),
-                 evt.value("request_id").toString().left(12),
-                 evt.value("user").toString(), evt.value("command").toString(),
-                 evt.value("state").toString(), evt.value("detail").toString());
-          ++newCount;
-        }
-      }
-      updateStatus();
-    });
+  void notifyJobAccepted(const QString &jobId, const QString &command) {
+    if (!jobId.isEmpty())
+      m_jobCommands.insert(jobId, command);
+    addRow(QDateTime::currentDateTime().toString("hh:mm:ss.zzz"),
+           "job_submitted", jobId.left(12), "operator", command, "submitted",
+           "Accepted by spine");
+    updateStatus();
   }
 
+public slots:
   void onSpineEvent(tinyshell::v1::JobEvent event) {
     const QString ts = QDateTime::currentDateTime().toString("hh:mm:ss.zzz");
+    const QString jobId = QString::fromStdString(event.job_id());
+    if (event.has_job_spec() && !event.job_spec().command().empty()) {
+      m_jobCommands.insert(jobId,
+                           QString::fromStdString(event.job_spec().command()));
+    }
+
     QString type;
     switch (event.type()) {
     case tinyshell::v1::JOB_CREATED:
@@ -189,9 +147,46 @@ private slots:
       }
     }();
 
-    addRow(ts, type, QString::fromStdString(event.job_id()).left(12),
-           QString::fromStdString(event.actor()), m_lastCommand, state, detail);
+    const auto command = m_jobCommands.value(jobId, m_pendingCommandHint);
+    addRow(ts, type, jobId.left(12), QString::fromStdString(event.actor()),
+           command, state, detail);
     updateStatus();
+  }
+
+private slots:
+  void pollHttpEvents() {
+    // BUG: live events repolled from the beginning and appeared empty/stale.
+    // FIX: long-poll only events newer than the last received sequence.
+    m_api->getText(QString("/control/events?since_sequence=%1").arg(m_lastHttpSeq),
+                   [this](QString body, QString err) {
+      if (!err.isEmpty()) {
+        m_statusLbl->setText("⚠ HTTP stream error: " + err);
+        return;
+      }
+      QJsonParseError pe;
+      const auto doc = QJsonDocument::fromJson(body.toUtf8(), &pe);
+      if (pe.error != QJsonParseError::NoError) {
+        m_statusLbl->setText("⚠ Invalid event JSON");
+        return;
+      }
+      const auto events = doc.object().value("events").toArray();
+      // Only add HTTP events that are newer than what we've already shown.
+      int newCount = 0;
+      for (int i = 0; i < events.size(); ++i) {
+        const auto evt = events[i].toObject();
+        const auto seq = static_cast<quint64>(evt.value("sequence").toDouble());
+        if (seq > m_lastHttpSeq) {
+          m_lastHttpSeq = seq;
+          addRow(evt.value("timestamp").toString().right(12),
+                 evt.value("type").toString(),
+                 evt.value("request_id").toString().left(12),
+                 evt.value("user").toString(), evt.value("command").toString(),
+                 evt.value("state").toString(), evt.value("detail").toString());
+          ++newCount;
+        }
+      }
+      updateStatus();
+    });
   }
 
 private:
@@ -274,9 +269,9 @@ private:
   }
 
   tsh::ApiClient *m_api = nullptr;
-  GrpcJobClient *m_grpcClient = nullptr;
   QTableWidget *m_table = nullptr;
   QLabel *m_statusLbl = nullptr;
   quint64 m_lastHttpSeq = 0;
-  QString m_lastCommand;
+  QString m_pendingCommandHint;
+  QHash<QString, QString> m_jobCommands;
 };

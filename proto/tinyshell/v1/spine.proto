@@ -5,6 +5,7 @@ package tinyshell.v1;
 service ControlPlaneService {
   rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
   rpc WatchJob(WatchJobRequest) returns (stream JobEvent);
+  rpc WatchAgents(WatchAgentsRequest) returns (stream AgentStatusEvent);
 }
 
 service AgentConnector {
@@ -181,4 +182,20 @@ enum StreamName {
   STREAM_NAME_UNSPECIFIED = 0;
   STDOUT = 1;
   STDERR = 2;
+}
+
+message WatchAgentsRequest {}
+
+message AgentStatusEvent {
+  string agent_id          = 1;
+  string hostname          = 2;
+  AgentStatus status       = 3;
+  int64 timestamp_unix_ms  = 4;
+}
+
+enum AgentStatus {
+  AGENT_STATUS_UNSPECIFIED  = 0;
+  AGENT_STATUS_CONNECTED    = 1;
+  AGENT_STATUS_DISCONNECTED = 2;
+  AGENT_STATUS_HEARTBEAT    = 3;
 }

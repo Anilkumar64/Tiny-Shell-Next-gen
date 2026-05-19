@@ -600,6 +600,29 @@ ExecResult SandboxExecutor::run(const tinyshell::v1::JobSpec &spec,
   if (!valid_workdir_token(spec.job_id()))
     throw std::runtime_error("invalid JobSpec job_id for sandbox workdir");
 
+  if (!spec.policy().allowed_absolute_paths().empty()) {
+    std::error_code ec;
+    const auto command_path = std::filesystem::canonical(spec.command(), ec);
+    bool path_allowed = false;
+    if (!ec) {
+      for (const auto &raw : spec.policy().allowed_absolute_paths()) {
+        std::error_code ec2;
+        const auto p = std::filesystem::canonical(raw, ec2);
+        if (!ec2 && p == command_path) {
+          path_allowed = true;
+          break;
+        }
+      }
+    }
+    if (!path_allowed) {
+      ExecResult r{};
+      r.exit_code = -1;
+      r.reason = "command not permitted";
+      r.failure = ExecutionFailure::EXECVE_FAILED;
+      return r;
+    }
+  }
+
   // Build argv.
   std::vector<std::string> argv_storage;
   argv_storage.push_back(spec.command());

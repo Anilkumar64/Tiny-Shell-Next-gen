@@ -1,5 +1,6 @@
 #pragma once
 #include "ApiClient.h"
+#include <algorithm>
 #include <QComboBox>
 #include <QDateTime>
 #include <QFile>
@@ -29,7 +30,8 @@ public:
 
 private slots:
   void pollAuditLogs() {
-    m_api->getText("/control/events", [this](QString body, QString err) {
+    m_api->getText(QString("/control/events?since_sequence=%1").arg(m_lastSeq),
+                   [this](QString body, QString err) {
       if (!err.isEmpty()) {
         m_statusLbl->setText("⚠ Stream offline");
         return;
@@ -39,7 +41,17 @@ private slots:
       if (pe.error != QJsonParseError::NoError)
         return;
 
-      m_allEvents = doc.object().value("events").toArray();
+      const auto events = doc.object().value("events").toArray();
+      for (const auto &value : events) {
+        const auto obj = value.toObject();
+        const auto seq = static_cast<quint64>(obj.value("sequence").toDouble());
+        if (seq <= m_lastSeq)
+          continue;
+        m_lastSeq = seq;
+        m_allEvents.append(obj);
+      }
+      while (m_allEvents.size() > 1000)
+        m_allEvents.removeAt(0);
       updateAuditTable();
     });
   }
@@ -220,5 +232,6 @@ private:
   QLabel *m_statusLbl = nullptr;
   QLineEdit *m_userFilter = nullptr;
   QComboBox *m_resultFilter = nullptr;
+  quint64 m_lastSeq = 0;
   QJsonArray m_allEvents;
 };

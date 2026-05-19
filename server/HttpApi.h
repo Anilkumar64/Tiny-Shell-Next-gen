@@ -1,12 +1,15 @@
 #pragma once
 
 #include "../common/Parser.h"
+#include "../config/tsh_config.h"
 #include "ExecutionEngine.h"
 #include "ExecutionEventBus.h"
 #include "JobScheduler.h"
 #include "Metrics.h"
+#include "MultiTenantManager.h"
 #include "Pipeline.h"
 #include "RbacManager.h"
+#include "SpineEventBridge.h"
 #include "ThreadPool.h"
 #include "WorkerTypes.h"
 #include <algorithm>
@@ -53,19 +56,24 @@ public:
           std::atomic<int> &risk, std::atomic<bool> &drift, Metrics &metrics,
           std::function<std::size_t()> queue_depth_fn,
           ExecutionEventBus *event_bus = nullptr,
-          std::vector<RemoteNode> workers = {})
+          std::vector<RemoteNode> workers = {},
+          SpineEventBridge *bridge = nullptr)
       : port_(p), bind_addr_(std::move(bind_addr)),
         expected_token_(std::move(token)), scheduler_(sched),
         current_risk_(risk), intent_drift_(drift), metrics_(metrics),
         queue_depth_fn_(std::move(queue_depth_fn)),
         event_bus_(event_bus ? event_bus : &owned_event_bus_),
-        execution_engine_(*event_bus_, current_risk_, intent_drift_),
-        workers_(std::move(workers)),
+        execution_engine_(*event_bus_, current_risk_, intent_drift_,
+                          &scheduler_),
+        spine_bridge_(bridge), workers_(std::move(workers)),
         started_at_(std::chrono::steady_clock::now()) {
+
     if (expected_token_.empty()) {
       throw std::runtime_error("HttpApi: TSH_API_TOKEN is required");
     }
     execution_engine_.set_workers(workers_);
+    admin_token_ = tsh::Config::read_string("TSH_ADMIN_TOKEN", "");
+    viewer_token_ = tsh::Config::read_string("TSH_VIEWER_TOKEN", "");
   }
 
   void start() {
@@ -287,7 +295,7 @@ private:
       identity.tenant = "default";
       return identity;
     }
-    const auto admin_token = env_value("TSH_ADMIN_TOKEN");
+    const auto &admin_token = admin_token_;
     if (!admin_token.empty() && constant_time_eq(token, admin_token)) {
       identity.ok = true;
       identity.role = "admin";
@@ -295,7 +303,7 @@ private:
       identity.tenant = "system";
       return identity;
     }
-    const auto viewer_token = env_value("TSH_VIEWER_TOKEN");
+    const auto &viewer_token = viewer_token_;
     if (!viewer_token.empty() && constant_time_eq(token, viewer_token)) {
       identity.ok = true;
       identity.role = "viewer";
@@ -380,6 +388,7 @@ private:
                              "Bearer token rejected");
       return identity;
     }
+
     if (!rbac_manager_.verify_permission(identity.role, perm)) {
       identity.forbidden = true;
       publish_security_event(identity, client_ip, "AUTH_DENIED",
@@ -387,7 +396,6 @@ private:
                              "role " + identity.role + " lacks permission");
       return identity;
     }
-
     ExecutionEvent event;
     event.type = ExecutionEventType::Authenticated;
     event.request_id = std::to_string(
@@ -399,7 +407,8 @@ private:
     event.detail =
         "role=" + identity.role + " token_sha256=" + token_hash(identity.token);
     event.result = "ok";
-    event_bus_->publish(std::move(event));
+    if (perm == Permission::EXECUTE_COMMAND || perm == Permission::MANAGE_JOBS)
+      event_bus_->publish(std::move(event));
     return identity;
   }
 
@@ -659,6 +668,9 @@ private:
 
   void start_probe_thread() {
     probe_thread_ = std::thread([this]() {
+      for (int i = 0; i < 30 && running_.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
       while (running_.load()) {
         {
           std::unordered_map<std::string, bool> fresh;
@@ -679,6 +691,7 @@ private:
                   id, WorkerHealthStatus::UNREACHABLE);
               continue;
             }
+
             const bool probed = probe_worker(w);
             if (probed) {
               // BUG: recovered workers stayed excluded after reconnect.
@@ -821,8 +834,7 @@ private:
     }
     // BUG: /control/events serialized all events on every dashboard poll.
     // FIX: return only events after since_sequence, capped at 1000 entries.
-    const auto events =
-        event_bus_->wait_snapshot_since(since, 1000, std::chrono::seconds(10));
+    const auto events = event_bus_->snapshot_since(since, 1000);
     std::ostringstream json;
     json << "{\"events\":[";
     bool first = true;
@@ -881,6 +893,75 @@ private:
          << ",\"queue_depth\":" << queue_depth_fn_()
          << ",\"event_bus_size_current\":" << event_bus_->size()
          << ",\"event_bus_evictions_total\":" << event_bus_->evictions() << "}";
+    return json.str();
+  }
+
+  std::string workers_json() const {
+    const auto events = event_bus_->snapshot();
+    std::ostringstream json;
+    json << "{\"workers\":[";
+    bool first_worker = true;
+    const auto emit_worker = [&](const std::string &id, bool online,
+                                 const WorkerTelemetry &worker) {
+      if (!first_worker)
+        json << ',';
+      first_worker = false;
+      json << "{\"node_id\":\"" << json_escape(id)
+           << "\",\"online\":" << (online ? "true" : "false")
+           << ",\"cpu_usage\":" << worker.cpu_usage
+           << ",\"ram_usage\":" << worker.ram_usage
+           << ",\"active_jobs\":" << worker.active_jobs
+           << ",\"last_heartbeat\":\""
+           << json_escape(ExecutionEventBus::now_iso8601())
+           << "\",\"running_command\":\"" << json_escape(worker.running_command)
+           << "\",\"health_score\":" << (online ? worker.health_score : 0.0)
+           << "}";
+    };
+
+    if (workers_.empty()) {
+      emit_worker("local-worker", true,
+                  worker_telemetry(events, "local-worker"));
+    } else {
+      for (const auto &configured_worker : workers_) {
+        const auto id = worker_node_id(configured_worker);
+        emit_worker(id, cached_worker_online(id), worker_telemetry(events, id));
+      }
+    }
+    json << "]}";
+    return json.str();
+  }
+
+  std::string tenants_json() const {
+    std::ostringstream json;
+    json << "{\"tenants\":[";
+    bool first = true;
+    for (const auto &tenant : multi_tenant_manager_.list_tenants()) {
+      if (!first)
+        json << ',';
+      first = false;
+      json << "{\"id\":\"" << json_escape(tenant.tenant_id)
+           << "\",\"name\":\"" << json_escape(tenant.tenant_name)
+           << "\",\"owner\":\"" << json_escape(tenant.owner)
+           << "\",\"active\":" << (tenant.is_active ? "true" : "false")
+           << ",\"quota_jobs\":" << tenant.resource_quota_jobs
+           << ",\"quota_memory_mb\":" << tenant.resource_quota_memory_mb
+           << ",\"quota_cpu_percent\":" << tenant.resource_quota_cpu_percent
+           << "}";
+    }
+    json << "],\"users\":[";
+    first = true;
+    for (const auto &user : multi_tenant_manager_.list_users()) {
+      if (!first)
+        json << ',';
+      first = false;
+      json << "{\"id\":\"" << json_escape(user.user_id)
+           << "\",\"username\":\"" << json_escape(user.username)
+           << "\",\"tenant_id\":\"" << json_escape(user.tenant_id)
+           << "\",\"role\":\"" << json_escape(user.role)
+           << "\",\"active\":" << (user.is_active ? "true" : "false")
+           << "}";
+    }
+    json << "]}";
     return json.str();
   }
 
@@ -1139,6 +1220,30 @@ private:
       } else {
         send_http_response(guard.ssl, client_fd, 200, events_json(request));
       }
+    } else if (request.rfind("GET /control/workers", 0) == 0) {
+      auto auth = authorize(request, client_ip, Permission::READ_CLUSTER_STATUS,
+                            "/control/workers");
+      if (!auth.ok) {
+        send_http_response(guard.ssl, client_fd, 401,
+                           "{\"error\":\"unauthorized\"}");
+      } else if (auth.forbidden) {
+        send_http_response(guard.ssl, client_fd, 403,
+                           "{\"error\":\"forbidden\"}");
+      } else {
+        send_http_response(guard.ssl, client_fd, 200, workers_json());
+      }
+    } else if (request.rfind("GET /control/tenants", 0) == 0) {
+      auto auth = authorize(request, client_ip, Permission::READ_CLUSTER_STATUS,
+                            "/control/tenants");
+      if (!auth.ok) {
+        send_http_response(guard.ssl, client_fd, 401,
+                           "{\"error\":\"unauthorized\"}");
+      } else if (auth.forbidden) {
+        send_http_response(guard.ssl, client_fd, 403,
+                           "{\"error\":\"forbidden\"}");
+      } else {
+        send_http_response(guard.ssl, client_fd, 200, tenants_json());
+      }
     } else if (request.rfind("GET /control/security", 0) == 0) {
       auto auth = authorize(request, client_ip, Permission::READ_AUDIT_LOG,
                             "/control/security");
@@ -1206,6 +1311,8 @@ private:
           exec_request.command = cmd;
 
           const auto result = execution_engine_.execute(exec_request);
+          if (spine_bridge_) // ADD
+            spine_bridge_->watch_job(exec_request.request_id);
           metrics_.record_command(
               result.ok, std::chrono::milliseconds(result.duration_ms));
           if (result.ok) {
@@ -1295,6 +1402,8 @@ private:
   ExecutionEventBus *event_bus_;
   ExecutionEngine execution_engine_;
   RbacManager rbac_manager_;
+  MultiTenantManager multi_tenant_manager_;
+  SpineEventBridge *spine_bridge_ = nullptr;
   std::vector<RemoteNode> workers_;
   std::chrono::steady_clock::time_point started_at_;
   std::atomic<bool> running_{false};
@@ -1312,6 +1421,8 @@ private:
   std::deque<TraceRecord> traces_;
   std::mutex rate_mutex_;
   std::unordered_map<std::string, RateBucket> rate_buckets_;
+  std::string admin_token_;
+  std::string viewer_token_;
 };
 
 } // namespace tsh

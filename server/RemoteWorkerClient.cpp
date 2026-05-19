@@ -1,6 +1,8 @@
 #include "RemoteWorkerClient.h"
 #include "../common/SecureChannel.h"
 #include "../common/transport/TcpTransport.h"
+#include "../spine/common/JobSigner.h"
+#include "tinyshell/v1/spine.pb.h"
 #include <arpa/inet.h>
 #include <cstring>
 #include <memory>
@@ -56,6 +58,11 @@ struct AddrInfoDeleter {
 
 std::string gai_message(int rc) {
   return rc == EAI_SYSTEM ? std::strerror(errno) : gai_strerror(rc);
+}
+
+static std::string env_string(const char *name, const std::string &fallback) {
+  const char *v = std::getenv(name);
+  return v ? v : fallback;
 }
 
 Fd connect_worker_socket(const RemoteNode &node, std::string *error) {
@@ -115,8 +122,21 @@ std::string RemoteWorkerClient::execute_node_stream(
              " failed.";
     }
 
-    if (!channel.send_message(serialized_ast,
-                              SecureChannel::MsgType::COMMAND)) {
+    const auto signing_key = env_string("TSH_JOB_SIGNING_KEY", "");
+    if (signing_key.empty()) {
+      return "[Error] TSH_JOB_SIGNING_KEY not set on server.";
+    }
+    tsh::spine::JobSigner signer("server", signing_key);
+
+    tinyshell::v1::JobSpec spec;
+    spec.set_command(reinterpret_cast<const char *>(serialized_ast.data()),
+                     serialized_ast.size());
+    const auto signed_spec = signer.sign(spec);
+
+    std::vector<uint8_t> signed_bytes(signed_spec.ByteSizeLong());
+    signed_spec.SerializeToArray(signed_bytes.data(), signed_bytes.size());
+
+    if (!channel.send_message(signed_bytes, SecureChannel::MsgType::COMMAND)) {
       return "[Error] Failed to send job to " + worker_node_id(node) + ".";
     }
 
@@ -129,7 +149,6 @@ std::string RemoteWorkerClient::execute_node_stream(
                    ? "[Error] Worker connection closed before completion."
                    : final_status;
       }
-
       const std::string payload(response_vec.begin(), response_vec.end());
       if (type == SecureChannel::MsgType::COMMAND) {
         on_chunk(payload, false);

@@ -16,6 +16,11 @@ struct Config {
   std::string api_bind_addr = "127.0.0.1";
   std::string api_token;
   std::string zk_secret;
+  std::string admin_token;
+  std::string viewer_token;
+  std::string job_signing_key;
+  std::string audit_log_path = "tsh_security_audit.log";
+  std::string zk_ledger_path = "tsh_zk_audit.ledger";
 
   // Load configuration from environment variables.
   // Optional variables fall back to their defaults when unset.
@@ -28,6 +33,11 @@ struct Config {
     cfg.api_bind_addr = read_string("TSH_API_BIND_ADDR", cfg.api_bind_addr);
     cfg.api_token = read_string("TSH_API_TOKEN", "");
     cfg.zk_secret = read_string("TSH_ZK_SECRET", "");
+    cfg.audit_log_path = read_string("TSH_AUDIT_LOG", "tsh_security_audit.log");
+    cfg.zk_ledger_path = read_string("TSH_ZK_LEDGER", "tsh_zk_audit.ledger");
+    cfg.admin_token = read_string("TSH_ADMIN_TOKEN", "");
+    cfg.viewer_token = read_string("TSH_VIEWER_TOKEN", "");
+    cfg.job_signing_key = read_string("TSH_JOB_SIGNING_KEY", "");
 
     return cfg;
   }

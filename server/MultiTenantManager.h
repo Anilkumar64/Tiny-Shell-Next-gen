@@ -224,6 +224,24 @@ public:
 
   RbacManager &get_rbac_manager() { return *rbac_manager_; }
 
+  std::vector<Tenant> list_tenants() const {
+    std::vector<Tenant> out;
+    out.reserve(tenants_.size());
+    for (const auto &[_, tenant] : tenants_) {
+      out.push_back(tenant);
+    }
+    return out;
+  }
+
+  std::vector<TenantUser> list_users() const {
+    std::vector<TenantUser> out;
+    out.reserve(tenant_users_.size());
+    for (const auto &[_, user] : tenant_users_) {
+      out.push_back(user);
+    }
+    return out;
+  }
+
 private:
   std::map<std::string, Tenant> tenants_;
   std::map<std::string, TenantUser> tenant_users_;

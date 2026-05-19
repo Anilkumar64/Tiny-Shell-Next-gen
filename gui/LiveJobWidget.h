@@ -65,18 +65,29 @@ public:
             [this](const QString &jobId, const QString &message) {
               m_status->setText("Submitted " + jobId + " · " + message);
               appendLifecycle("submit.accepted", message);
+              emit jobAccepted(jobId, m_pendingCommand);
             });
     connect(m_client, &GrpcJobClient::failed, this, [this](const QString &err) {
       m_submit->setEnabled(true);
       m_status->setText("Failed · " + err);
       appendLifecycle("client.error", err);
+      emit jobCompleted(false);
     });
+    connect(m_client, &GrpcJobClient::streamDisconnected, this,
+            [this](const QString &err) {
+              m_status->setText("Stream reconnecting...");
+              appendLifecycle("stream.reconnect", err);
+            });
     connect(m_client, &GrpcJobClient::eventReceived, this,
             &LiveJobWidget::onEvent);
   }
 
+  GrpcJobClient *grpcClient() const { return m_client; }
+
 signals:
   void jobSubmitted(const QString &command);
+  void jobAccepted(const QString &jobId, const QString &command);
+  void jobCompleted(bool ok);
 
 private slots:
   void submit() {
@@ -85,6 +96,7 @@ private slots:
     m_submit->setEnabled(false);
     m_status->setText("Submitting...");
     const QString cmd = m_command->text().trimmed();
+    m_pendingCommand = cmd;
     emit jobSubmitted(cmd);
     m_client->submit(m_user->text().trimmed(), cmd);
   }
@@ -111,6 +123,7 @@ private slots:
           QString("Exited code=%1 · %2")
               .arg(event.exit().exit_code())
               .arg(QString::fromStdString(event.exit().reason())));
+      emit jobCompleted(event.exit().exit_code() == 0);
     } else if (event.payload_case() == tinyshell::v1::JobEvent::kMessage) {
       appendLifecycle("message", QString::fromStdString(event.message()));
       if (event.type() == tinyshell::v1::JOB_FAILED ||
@@ -121,6 +134,7 @@ private slots:
         m_submit->setEnabled(true);
         m_status->setText("Failed · " +
                           QString::fromStdString(event.message()));
+        emit jobCompleted(false);
       }
     }
 
@@ -176,6 +190,7 @@ private:
   GrpcJobClient *m_client = nullptr;
   QLineEdit *m_user = nullptr;
   QLineEdit *m_command = nullptr;
+  QString m_pendingCommand;
   QPushButton *m_submit = nullptr;
   QLabel *m_status = nullptr;
   QPlainTextEdit *m_lifecycle = nullptr;

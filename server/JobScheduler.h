@@ -30,7 +30,6 @@ class JobScheduler {
   std::array<size_t, SHARD_COUNT> next_node_idx{};
 
   size_t shard_for(const std::string &job_id) const {
-    // FIX[SCALE-2]: Partition scheduler state instead of one global mutex.
     return std::hash<std::string>{}(job_id) % SHARD_COUNT;
   }
 
@@ -40,11 +39,12 @@ public:
     std::lock_guard<std::mutex> lock(shard_mutexes[shard]);
     sharded_nodes[shard].push_back(
         {{host, port, host + ":" + std::to_string(port)}, false, 0});
+    // FIX: also register into health_manager_ so the background heartbeat
+    // thread actually polls this node.
+    health_manager_.add_node(host, port);
   }
 
   void mark_node_healthy(const std::string &id) {
-    // BUG: recovered workers had no scheduler-state transition back to active.
-    // FIX: successful reconnect explicitly restores HEALTHY scheduling state.
     update_node(id, [](NodeState &node) {
       node.status = WorkerHealthStatus::HEALTHY;
       node.consecutive_failures = 0;
@@ -53,8 +53,6 @@ public:
   }
 
   void mark_node_unreachable(const std::string &id) {
-    // BUG: unreachable workers remained in the round-robin scheduling pool.
-    // FIX: UNREACHABLE nodes are retained for reconnect but skipped for jobs.
     update_node(id, [](NodeState &node) {
       node.status = WorkerHealthStatus::UNREACHABLE;
       node.busy = false;
@@ -62,8 +60,6 @@ public:
   }
 
   void mark_node_failure(const std::string &id) {
-    // BUG: repeated worker failures did not reduce future allocation.
-    // FIX: five consecutive job failures trip a DEGRADED circuit breaker.
     update_node(id, [](NodeState &node) {
       ++node.consecutive_failures;
       if (node.consecutive_failures >= 5) {
@@ -72,19 +68,30 @@ public:
     });
   }
 
-  // Schedules a job to the next available node using Round Robin
+  bool is_node_healthy(const std::string &id) const {
+    for (std::size_t s = 0; s < SHARD_COUNT; ++s) {
+      for (const auto &node : sharded_nodes[s]) {
+        if (worker_node_id(node.node) == id)
+          return node.status != WorkerHealthStatus::UNREACHABLE;
+      }
+    }
+    return false; // unknown node — treat as unhealthy
+  }
+
+  // FIX: expose start/stop so Server::run() can drive the health-check thread.
+  void start_health_check() { health_manager_.start_health_check(); }
+  void stop_health_check() { health_manager_.stop(); }
+
   std::future<std::string> schedule_job(std::shared_ptr<AstNode> ast,
                                         bool use_speculative = false) {
-    // BUG-22 FIX: Previously shard_for(ast->name) was used, meaning every
-    // pipeline that starts with "ps" hashes to the same shard — defeating
-    // sharding for the most common command and serialising all ps jobs through
-    // one mutex.  We now shard by a random 64-bit job ID so load is spread
-    // evenly across shards regardless of the command name.
+    // Shard by time-based random ID to avoid command-name concentration
+    // (BUG-22).
     const size_t shard =
         shard_for(std::to_string(std::hash<uint64_t>{}(static_cast<uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count()))));
     std::lock_guard<std::mutex> lock(shard_mutexes[shard]);
     auto &cluster_nodes = sharded_nodes[shard];
+
     if (cluster_nodes.empty()) {
       std::promise<std::string> p;
       p.set_value("[Error] No nodes registered in cluster.");
@@ -92,12 +99,9 @@ public:
     }
 
     if (use_speculative && cluster_nodes.size() >= 2) {
-      // FEATURE D-4: Speculative Fan-out routing
       std::vector<RemoteNode> speculative_cluster = {cluster_nodes[0].node,
                                                      cluster_nodes[1].node};
       std::promise<std::string> p;
-      // FIX[SCALE-3]: Keep scheduler bounded; speculative fan-out remains
-      // opt-in but not auto-threaded here.
       p.set_value(SpeculativeFanOut::execute_fastest(ast, speculative_cluster));
       return p.get_future();
     }
@@ -112,7 +116,6 @@ public:
     auto &selected = cluster_nodes[*selected_index];
     selected.busy = true;
 
-    // Return an async task for the job
     std::promise<std::string> p;
     auto results = DistributedOrchestrator::fan_out(ast, {selected.node});
     selected.busy = false;
@@ -133,17 +136,15 @@ public:
     return p.get_future();
   }
 
-  // FEATURE D-1: Trust-less execution routing
   std::future<std::string> schedule_bft_job(std::shared_ptr<AstNode> ast) {
-    // BUG-27 FIX: Previously shard_for(ast->name) caused all BFT jobs for
-    // the same command (e.g. "ps") to hash to the same shard — the same
-    // concentration bug fixed in schedule_job by BUG-22.  Use a time-based
-    // random shard ID instead.
+    // Shard by time-based random ID to avoid command-name concentration
+    // (BUG-27).
     const size_t shard =
         shard_for(std::to_string(std::hash<uint64_t>{}(static_cast<uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count()))));
     std::lock_guard<std::mutex> lock(shard_mutexes[shard]);
     auto &cluster_nodes = sharded_nodes[shard];
+
     if (cluster_nodes.size() < 3) {
       std::promise<std::string> p;
       p.set_value("[BFT Error] Requires minimum 3 nodes for Byzantine fault "
@@ -153,7 +154,6 @@ public:
     std::vector<RemoteNode> bft_cluster = {
         cluster_nodes[0].node, cluster_nodes[1].node, cluster_nodes[2].node};
     std::promise<std::string> p;
-    // FIX[SCALE-3]: Avoid unbounded background task creation in scheduler APIs.
     p.set_value(BftExecutor::execute_with_bft(ast, bft_cluster, 3));
     return p.get_future();
   }
@@ -181,6 +181,10 @@ public:
   }
 
 private:
+  // FIX: declared here so start_health_check()/stop_health_check() and
+  // register_node() all operate on the same instance.
+  ClusterHealthManager health_manager_;
+
   template <typename F> void update_node(const std::string &id, F &&fn) {
     for (size_t i = 0; i < SHARD_COUNT; ++i) {
       std::lock_guard<std::mutex> lock(shard_mutexes[i]);
@@ -195,8 +199,6 @@ private:
 
   std::optional<std::size_t>
   select_schedulable_index(std::vector<NodeState> &nodes, std::size_t shard) {
-    // BUG: round-robin selected dead workers without checking live health.
-    // FIX: selection scans for HEALTHY/DEGRADED nodes and skips unreachable.
     for (std::size_t attempts = 0; attempts < nodes.size(); ++attempts) {
       auto index = next_node_idx[shard] % nodes.size();
       next_node_idx[shard] = (next_node_idx[shard] + 1) % nodes.size();

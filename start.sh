@@ -4,6 +4,14 @@
 # Usage:  sudo bash start.sh
 set -eo pipefail
 
+# ── Load .env if present ──────────────────────────────────────────────────────
+if [[ -f "$HOME/.env_tinyshell" ]]; then
+    set -a
+    source "$HOME/.env_tinyshell"
+    set +a
+    echo "[TinyShell] Loaded env from ~/.env_tinyshell"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
 
@@ -75,8 +83,16 @@ cmake -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_TESTING=OFF 2>&1 | tee /tmp/tsh_cmake.log | tail -5
 
 echo "[TinyShell] Building..."
+cmake -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_PREFIX_PATH=/usr/lib/x86_64-linux-gnu/cmake/Qt6 \
+      -DBUILD_TESTING=ON 2>&1 | tee /tmp/tsh_cmake.log | tail -5
+
 cmake --build "$BUILD_DIR" -j"$(nproc)" \
-      --target tsh_server tsh_worker tsh_spine_server tsh_spine_agent tsh_gui tsh_server_gui
+      --target tsh_server tsh_worker tsh_spine_server tsh_spine_agent tsh_gui tsh_server_gui tsh_tests
+
+echo "[TinyShell] Running tests..."
+"$BUILD_DIR/tests/tsh_tests" 2>&1 | tee /tmp/tsh_tests.log
+echo "[TinyShell] Tests done. Log at /tmp/tsh_tests.log"
 
 # ── Capabilities (bind any port, no permanent root needed) ───────────────────
 for bin in "$BUILD_DIR/tsh_server" "$BUILD_DIR/tsh_worker" \
@@ -137,18 +153,44 @@ TSH_ZK_SECRET=$ZK_SECRET \
 TSH_WORKERS="$WORKERS" \
 TSH_TOFU_AUTO_TRUST="$TSH_TOFU_AUTO_TRUST" \
 TSH_I_KNOW_THIS_IS_INSECURE=1 \
+TSH_JOB_SIGNING_KEY="$JOB_SIGNING_KEY" \
+TSH_SPINE_CONTROL_ADDR="$SPINE_CONTROL_TARGET" \
+TSH_SPINE_TARGET="$SPINE_CONTROL_TARGET" \
+TSH_ADMIN_TOKEN="${TSH_ADMIN_TOKEN:-}" \
+TSH_VIEWER_TOKEN="${TSH_VIEWER_TOKEN:-}" \
     "$BUILD_DIR/tsh_server" &
 SERVER_PID=$!
 
 trap 'echo "[TinyShell] Shutting down...";
-      kill "$SERVER_PID" "$WORKER_PID" "$SPINE_SERVER_PID" "$SPINE_AGENT_PID" 2>/dev/null;
+      kill "$SERVER_PID" "$WORKER_PID" "$SPINE_SERVER_PID" "$SPINE_AGENT_PID" "$SERVER_GUI_PID" 2>/dev/null;
       wait "$SERVER_PID" "$WORKER_PID" "$SPINE_SERVER_PID" "$SPINE_AGENT_PID" 2>/dev/null;
       echo "[TinyShell] Done."' EXIT
 
 sleep 2
 
-# ── GUI (foreground — keeps the script alive, exits = everything stops) ───────
-echo "[TinyShell] Starting GUI (connecting to API at :$API_PORT, spine at $SPINE_CONTROL_TARGET)..."
+# ── GUI (both server and client) ──────────────────────────────────────────────
+echo "[TinyShell] Starting Server GUI..."
+env -i \
+    HOME="$HOME" \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    DISPLAY="${DISPLAY:-}" \
+    XAUTHORITY="${XAUTHORITY:-}" \
+    WAYLAND_DISPLAY="" \
+    QT_QPA_PLATFORM="xcb" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+    TERM="${TERM:-xterm-256color}" \
+    LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu" \
+    QT_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/qt6/plugins \
+    TSH_GRPC_INSECURE_DEV=1 \
+    TSH_I_KNOW_THIS_IS_INSECURE=1 \
+    TSH_SPINE_TARGET="$SPINE_CONTROL_TARGET" \
+    "$BUILD_DIR/gui/tsh_server_gui" \
+        --url "https://127.0.0.1:$API_PORT" \
+        --token "$API_TOKEN" \
+    2>&1 | tee /tmp/tsh_server_gui.log &
+SERVER_GUI_PID=$!
+
+echo "[TinyShell] Starting Client GUI..."
 env -i \
     HOME="$HOME" \
     PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
@@ -166,4 +208,6 @@ env -i \
     "$BUILD_DIR/gui/tsh_gui" \
         --url "https://127.0.0.1:$API_PORT" \
         --token "$API_TOKEN" \
-    2>&1 | tee /tmp/tsh_gui.log
+    2>&1 | tee /tmp/tsh_client_gui.log
+
+wait $SERVER_GUI_PID

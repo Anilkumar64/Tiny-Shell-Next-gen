@@ -1,3 +1,4 @@
+
 // test_sandbox_executor.cpp — fixed
 //
 // New tests added to address audit gaps:
@@ -167,7 +168,7 @@ TEST(SandboxExecutorTest, EnforcesTimeoutAsProcessGroupTermination) {
 
 TEST(SandboxExecutorTest, RejectsCommandOutsideAllowlist) {
   auto spec = base_spec("/bin/sh");
-  spec.set_job_id(unique_job_id());
+  spec.mutable_policy()->add_allowed_absolute_paths("/usr/bin/uptime");
 
   tsh::spine::SandboxExecutor executor;
   const auto result = executor.run(spec, null_cb());

@@ -171,17 +171,23 @@ private:
     auto *live = new LiveJobWidget(m_stack);
     auto *dash = new DashboardWidget(m_api, m_stack);
     auto *server = new ServerControlPanelPage(m_api, m_stack);
-    auto *cluster = new ClusterWidget(m_stack);
-    auto *jobs = new JobWidget(m_stack);
-    auto *rbac = new RbacWidget(m_stack);
-    auto *tenants = new TenantWidget(m_stack);
-    auto *audit = new AuditWidget(m_stack);
+    auto *cluster = new ClusterWidget(m_api, m_stack);
+    auto *jobs = new JobWidget(m_api, m_stack);
+    auto *rbac = new RbacWidget(m_api, m_stack);
+    auto *audit = new AuditWidget(m_api, m_stack);
+    auto *tenants = new TenantWidget(m_api, m_stack);
     auto *config = new ConfigWidget(m_api, m_stack);
 
     // Forward the command name from LiveJobWidget to the Server event stream
     // so spine gRPC events show the command in the "Command" column.
     connect(live, &LiveJobWidget::jobSubmitted, server->eventStream(),
             &ExecutionEventStreamWidget::notifyJobSubmit);
+    connect(live, &LiveJobWidget::jobAccepted, server->eventStream(),
+            &ExecutionEventStreamWidget::notifyJobAccepted);
+    connect(live, &LiveJobWidget::jobCompleted, dash,
+            [dash](bool) { dash->refresh(); });
+    connect(live->grpcClient(), &GrpcJobClient::eventReceived,
+            server->eventStream(), &ExecutionEventStreamWidget::onSpineEvent);
 
     for (QWidget *w : {(QWidget *)live, (QWidget *)dash, (QWidget *)server,
                        (QWidget *)cluster, (QWidget *)jobs, (QWidget *)rbac,
@@ -196,7 +202,7 @@ private:
         " color:#4a5068; font-size:11px; }");
 
     // Start on dashboard
-    navigate(0);
+    navigate(1);
 
     // Poll reachability every 5s
     auto *reachTimer = new QTimer(this);

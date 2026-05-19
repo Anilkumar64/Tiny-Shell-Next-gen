@@ -13,6 +13,7 @@
 #include "AstMinifier.h"
 #include "BpfFilterCompiler.h"
 #include "ControllerTrust.h"
+#include "ExecutionEventBus.h" // BUG FIX: was missing — handle_client must publish events
 #include "ExecutionTimeout.h"
 #include "HttpApi.h"
 #include "IntentDrift.h"
@@ -114,14 +115,23 @@ std::vector<tsh::RemoteNode> parse_worker_nodes_from_env() {
 
 Server::Server(int p) : port(p) {}
 
-void Server::handle_client(int client_fd, tsh::TuiCore &tui,
-                           const tsh::CapabilityManager &cap_manager,
-                           tsh::PipelineValidator &ast_validator,
-                           tsh::StructuredAuditLogger &audit_logger,
-                           tsh::ZkAuditTrail &zk_ledger,
-                           std::atomic<int> &global_risk,
-                           std::atomic<bool> &global_drift,
-                           tsh::Metrics &metrics) {
+// BUG FIX: Added `tsh::ExecutionEventBus &event_bus` parameter.
+// Previously this parameter was missing entirely. handle_client had no
+// reference to the event bus and therefore never published any events:
+// no ClientConnected, no Authenticated, no ExecutionStarted, no
+// ExecutionCompleted. The GUI dashboard (ClientConnectionPanel,
+// ExecutionEventStreamWidget) polls /control/events which reads from that
+// same event_bus — so the dashboard showed nothing, and the server page
+// showed no connected clients, because zero events were ever published
+// by the TCP path.
+void Server::handle_client(
+    int client_fd, tsh::TuiCore &tui, const tsh::CapabilityManager &cap_manager,
+    tsh::PipelineValidator &ast_validator,
+    tsh::StructuredAuditLogger &audit_logger, tsh::ZkAuditTrail &zk_ledger,
+    std::atomic<int> &global_risk, std::atomic<bool> &global_drift,
+    tsh::IntentDrift &drift_detector, std::mutex &drift_mutex,
+    tsh::Metrics &metrics,
+    tsh::ExecutionEventBus &event_bus) { // BUG FIX: added
   metrics.connection_opened();
   const auto connection_guard =
       std::unique_ptr<int, void (*)(int *)>(new int(client_fd), [](int *fd) {
@@ -142,6 +152,34 @@ void Server::handle_client(int client_fd, tsh::TuiCore &tui,
     tui.log_message("[Crypto] Handshake successful (X25519/TOFU).");
     std::string controller_id;
     bool controller_trusted = false;
+
+    // BUG FIX: Capture the client IP at connection time for use in events.
+    // Previously no IP was available inside handle_client at all; now it is
+    // recovered from the fd via getpeername so events carry the correct IP.
+    std::string client_ip_str;
+    {
+      sockaddr_in peer{};
+      socklen_t peer_len = sizeof(peer);
+      if (getpeername(client_fd, reinterpret_cast<sockaddr *>(&peer),
+                      &peer_len) == 0) {
+        char buf[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &peer.sin_addr, buf, INET_ADDRSTRLEN);
+        client_ip_str = buf;
+      }
+    }
+
+    // BUG FIX: Publish ClientConnected so the server GUI shows the connection.
+    // This event is what ClientConnectionPanel reads from /control/events to
+    // populate the "Live Client Connections" table. Without it the table stayed
+    // empty even with active TCP clients.
+    {
+      tsh::ExecutionEvent conn_event;
+      conn_event.type = tsh::ExecutionEventType::ClientConnected;
+      conn_event.client_ip = client_ip_str;
+      conn_event.state = "connected";
+      conn_event.detail = "X25519+AES256-GCM handshake complete";
+      event_bus.publish(std::move(conn_event));
+    }
 
     while (g_running.load()) {
       std::vector<uint8_t> msg;
@@ -164,6 +202,19 @@ void Server::handle_client(int client_fd, tsh::TuiCore &tui,
             response += controller_trusted ? "Trust: registered\n"
                                            : "Trust: unregistered\n";
             ok = true;
+
+            // BUG FIX: Publish Authenticated event so the dashboard can show
+            // the client's identity (user/controller_id) and IP. Without this,
+            // ClientConnectionPanel.pollClients() never gets an event with a
+            // non-empty `user` field, so the client table never populates.
+            tsh::ExecutionEvent auth_event;
+            auth_event.type = tsh::ExecutionEventType::Authenticated;
+            auth_event.user = controller_id;
+            auth_event.client_ip = client_ip_str;
+            auth_event.state = controller_trusted ? "trusted" : "unregistered";
+            auth_event.detail = "controller-hello received";
+            event_bus.publish(std::move(auth_event));
+
           } else if (cmd == "agent-info") {
             cap_manager.require("cap_fs_read");
             response = tsh::AgentIdentity::format_human(
@@ -211,7 +262,7 @@ void Server::handle_client(int client_fd, tsh::TuiCore &tui,
             response = "State restored.\n";
           } else if (cmd == "shell") {
             cap_manager.require("cap_exec_shell");
-            zk_ledger.log_secure_event("client_01", "shell");
+            zk_ledger.log_secure_event(controller_id, "shell");
             response = tsh::PtySession::run(sc, audit_logger);
             // BUG-10 FIX: PtySession::run() returns "" on clean exit and
             // an error string on failure (e.g. forkpty returned -1).
@@ -231,7 +282,7 @@ void Server::handle_client(int client_fd, tsh::TuiCore &tui,
             auto ast = tsh::Parser::parse_pipeline(cmd);
             if (ast) {
               ast_validator.validate(ast);
-              zk_ledger.log_secure_event("client_01", cmd);
+              zk_ledger.log_secure_event(controller_id, cmd);
               auto current_node = ast;
               while (current_node) {
                 if (current_node->type == tsh::OpType::FILTER) {
@@ -243,8 +294,8 @@ void Server::handle_client(int client_fd, tsh::TuiCore &tui,
 
               const int risk = tsh::RiskScorer::calculate_score(ast);
               global_risk.store(risk);
-              static tsh::IntentDrift drift_detector;
-              static std::mutex drift_mutex;
+              // FIX (Bug 5): was static locals; now uses the references passed
+              // from run() so ownership and sharing are explicit.
               {
                 std::lock_guard<std::mutex> lock(drift_mutex);
                 global_drift.store(drift_detector.detect_drift(risk));
@@ -253,6 +304,20 @@ void Server::handle_client(int client_fd, tsh::TuiCore &tui,
               tsh::AstMinifier::minify(ast);
               tsh::TaintTracker::enforce_data_flow(ast);
               tsh::UnitValidator::validate_units(ast);
+
+              // BUG FIX: Publish ExecutionStarted so the dashboard's
+              // ExecutionEventStreamWidget shows commands as they run, and
+              // worker_telemetry() can compute active_jobs / running_command.
+              {
+                tsh::ExecutionEvent start_event;
+                start_event.type = tsh::ExecutionEventType::ExecutionStarted;
+                start_event.user = controller_id;
+                start_event.client_ip = client_ip_str;
+                start_event.command = cmd;
+                start_event.worker = "local-worker";
+                start_event.state = "running";
+                event_bus.publish(std::move(start_event));
+              }
 
               if (!tsh::SemanticDedup::instance().try_dedup(ast, response)) {
                 tsh::QueryPlanner::optimize(ast);
@@ -301,6 +366,25 @@ void Server::handle_client(int client_fd, tsh::TuiCore &tui,
           std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::steady_clock::now() - started);
       metrics.record_command(ok, elapsed);
+
+      // BUG FIX: Publish ExecutionCompleted/ExecutionFailed after every
+      // command so the dashboard event stream updates and worker telemetry
+      // (active_jobs, running_command) reflects the finished state.
+      if (!response.empty() && response.rfind("Command rejected:", 0) != 0 &&
+          response.rfind("Security Alert:", 0) != 0 &&
+          response.rfind("Execution Aborted:", 0) != 0 &&
+          response.rfind("AST Rejected:", 0) != 0) {
+        tsh::ExecutionEvent done_event;
+        done_event.type = ok ? tsh::ExecutionEventType::ExecutionCompleted
+                             : tsh::ExecutionEventType::ExecutionFailed;
+        done_event.user = controller_id;
+        done_event.client_ip = client_ip_str;
+        done_event.worker = "local-worker";
+        done_event.state = ok ? "completed" : "failed";
+        done_event.duration_ms = elapsed.count();
+        event_bus.publish(std::move(done_event));
+      }
+
       std::vector<uint8_t> resp_vec(response.begin(), response.end());
       if (!sc.send_message(resp_vec, SecureChannel::MsgType::COMMAND)) {
         break;
@@ -376,12 +460,16 @@ void Server::run() {
   }
 
   tsh::CapabilityManager cap_manager;
-  tsh::StructuredAuditLogger audit_logger("tsh_security_audit.log");
-  tsh::ZkAuditTrail zk_ledger("tsh_zk_audit.ledger");
+  tsh::StructuredAuditLogger audit_logger(cfg.audit_log_path);
+  tsh::ZkAuditTrail zk_ledger(cfg.zk_ledger_path);
   tsh::PipelineValidator ast_validator;
   tsh::JobScheduler scheduler;
   tsh::Metrics metrics;
   tsh::ExecutionEventBus event_bus;
+  tsh::SpineEventBridge spine_bridge(
+      &event_bus, &scheduler, &metrics,
+      tsh::Config::read_string("TSH_SPINE_CONTROL_ADDR", ""));
+
   tsh::ThreadPool pool(std::max(2u, std::thread::hardware_concurrency()));
   const auto agent_meta = tsh::AgentIdentity::load_metadata();
   const auto workers = parse_worker_nodes_from_env();
@@ -389,21 +477,35 @@ void Server::run() {
     scheduler.register_node(worker.host, worker.port);
   }
 
+  scheduler.start_health_check();
+
   std::atomic<int> global_risk{0};
   std::atomic<bool> global_drift{false};
+  // FIX (Bug 5): IntentDrift and its mutex were function-static locals inside
+  // handle_client(), which is called concurrently from the thread pool.
+  // Static-local initialisation is thread-safe in C++11, but the objects
+  // themselves were shared across all client threads with only a per-call
+  // lock_guard protecting detect_drift() — not the construction of the statics
+  // themselves during the first concurrent calls.  More importantly, declaring
+  // shared mutable state as a hidden static inside a thread-pool worker is a
+  // maintenance hazard: the lifetime and ownership are invisible to callers.
+  // Fixed by declaring them here at Server::run() scope (same lifetime as
+  // global_risk / global_drift) and passing them as references into
+  // handle_client, making the sharing explicit and the ownership clear.
+  tsh::IntentDrift drift_detector;
+  std::mutex drift_mutex;
   auto api = std::make_shared<tsh::HttpApi>(
       cfg.http_port, cfg.api_bind_addr, cfg.api_token, scheduler, global_risk,
       global_drift, metrics, [&pool]() { return pool.queue_depth(); },
-      &event_bus, workers);
-  api->start();
+      &event_bus, workers, &spine_bridge);
 
   cap_manager.grant("cap_fs_read");
-  // FIX[CAP-1]: cap_exec_shell was never granted, blocking all normal demo
-  // commands.
   cap_manager.grant("cap_exec_shell");
-  // FIX[CAP-1]: Reserve network-read capability for future netstat/ss-style
-  // safe readers.
   cap_manager.grant("cap_net_read");
+  cap_manager.grant("cap_exec_wasm");
+  cap_manager.grant("cap_state_restore");
+  api->start();
+
   audit_logger.log_event("system", "server_start", "startup sequence complete",
                          "ok");
 
@@ -412,9 +514,8 @@ void Server::run() {
   std::cout << "[TinyShell] Agent ID: " << agent_meta.agent_id << "\n"
             << "[TinyShell] Pairing code: " << agent_meta.pairing_code << "\n";
   std::cout << "[TinyShell] Ready. TCP listening on " << cfg.server_bind_addr
-            << ":" << cfg.server_port
-            << ", HTTP API on " << cfg.api_bind_addr << ":" << cfg.http_port
-            << "\n";
+            << ":" << cfg.server_port << ", HTTP API on " << cfg.api_bind_addr
+            << ":" << cfg.http_port << "\n";
   if (workers.empty()) {
     std::cout << "[TinyShell] No TSH_WORKERS configured; using local-worker "
                  "fallback.\n";
@@ -457,21 +558,27 @@ void Server::run() {
                      std::string(client_ip));
     // FIX[SCALE-1]: Bounded worker pool prevents one slow client from blocking
     // all others.
+    // BUG FIX: Pass event_bus into handle_client so it can publish events.
+    // Previously event_bus was captured in this lambda scope but never
+    // forwarded as a parameter — handle_client had no reference to it and
+    // published nothing.
     if (!pool.submit([client_fd, tui, &cap_manager, &ast_validator,
                       &audit_logger, &zk_ledger, &global_risk, &global_drift,
-                      &metrics]() {
+                      &drift_detector, &drift_mutex, &metrics,
+                      &event_bus]() { // BUG FIX: &event_bus added
           Server::handle_client(client_fd, *tui, cap_manager, ast_validator,
                                 audit_logger, zk_ledger, global_risk,
-                                global_drift, metrics);
+                                global_drift, drift_detector, drift_mutex,
+                                metrics, event_bus); // BUG FIX: event_bus added
         })) {
       close(client_fd);
       tui->log_message(
           "[Runtime] Rejected client because worker queue is saturated.");
     }
   }
-
   pool.shutdown();
   api->stop();
+  spine_bridge.stop();
   if (g_server_fd.exchange(-1) >= 0)
     close(server_fd);
   tui->log_message("[System] Server shutdown complete.");

@@ -29,6 +29,8 @@ target_link_libraries(tsh_tests PRIVATE
     tsh_infrastructure
     tsh_server_runtime
     tsh_spine_proto
+    tsh_spine_common   # FIX (Bug 3): SandboxExecutor.cpp compiled directly into
+                       # tsh_tests needs the spine/common signing + policy symbols.
     OpenSSL::Crypto
     Threads::Threads
 )

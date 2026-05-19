@@ -53,12 +53,10 @@ public:
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%dT%H:%M:%S");
+    std::tm tm_buf{};
+    localtime_r(&in_time_t, &tm_buf);
+    ss << std::put_time(&tm_buf, "%Y-%m-%dT%H:%M:%S");
 
-    // BUG-6 FIX: Hold the mutex for the entire log_secure_event call,
-    // including rotate_if_needed().  Previously rotate was called without any
-    // lock, so two concurrent threads could both detect the size threshold and
-    // both attempt the rename sequence, corrupting the rotation.
     std::lock_guard<std::mutex> lock(log_mutex_);
     rotate_if_needed(); // called inside the lock (BUG-6 FIX)
     unsigned char c_hash[SHA256_DIGEST_LENGTH];

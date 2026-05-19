@@ -1,18 +1,4 @@
-// SpineServer.cpp — fixed
-//
-// Bugs fixed:
-//  1. next_sequence() called store_->load_events_after() while holding
-//     sequence_mutex_, causing I/O under lock (deadlock risk / latency spike).
-//     Fixed with a double-checked load pattern: read outside lock, insert under
-//     lock only if still absent.
-//
-//  2. No stale-agent cleanup. agents_ map grew forever; dead agents kept being
-//     scheduled.  Fixed by a background monitor thread that evicts agents whose
-//     last heartbeat is older than kAgentHeartbeatTimeoutMs.
-//
-//  3. AgentSession::wait_pop blocked indefinitely; replaced with a timed wait
-//     so the outbound writer can notice session closure promptly.
-
+#include "../../common/FastFileLoader.h"
 #include "../../config/tsh_config.h"
 #include "CommandPolicy.h"
 #include "EventBus.h"
@@ -22,9 +8,6 @@
 #include "Time.h"
 #include "Uuid.h"
 #include "tinyshell/v1/spine.grpc.pb.h"
-
-#include <grpcpp/grpcpp.h>
-
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -34,6 +17,7 @@
 #include <cstdlib>
 #include <deque>
 #include <fstream>
+#include <grpcpp/grpcpp.h>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -41,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set> // FIX (eviction loop): needed for evicted_jobs_
 #include <vector>
 
 namespace {
@@ -53,12 +38,10 @@ std::string env_string(const char *name, const std::string &fallback = {}) {
   }
   return fallback;
 }
-
-std::string read_file(const std::string &path) {
+static std::string read_file(const std::string &path) {
   std::ifstream in(path, std::ios::binary);
-  if (!in) {
+  if (!in)
     throw std::runtime_error("failed to read file: " + path);
-  }
   return std::string(std::istreambuf_iterator<char>(in),
                      std::istreambuf_iterator<char>());
 }
@@ -122,6 +105,13 @@ public:
   }
 
   ~SpineControlPlane() {
+    // FIX (Bug 7): g_shutdown is only set by the SIGINT/SIGTERM signal handler.
+    // If SpineControlPlane is destroyed without a signal being received (e.g.
+    // in a unit test, or during orderly programmatic shutdown), the monitor
+    // thread loops forever on !g_shutdown.load() and monitor_thread_.join()
+    // hangs indefinitely.  Set g_shutdown here before joining so the monitor
+    // thread always sees the shutdown flag and exits promptly.
+    g_shutdown.store(true);
     if (monitor_thread_.joinable()) {
       monitor_thread_.join();
     }
@@ -269,6 +259,42 @@ public:
     return grpc::Status::OK;
   }
 
+  grpc::Status WatchAgents(
+      grpc::ServerContext *context, const tinyshell::v1::WatchAgentsRequest *,
+      grpc::ServerWriter<tinyshell::v1::AgentStatusEvent> *writer) override {
+    // Snapshot currently connected agents first.
+    {
+      std::lock_guard<std::mutex> lk(agents_mutex_);
+      for (auto &[id, session] : agents_) {
+        if (session->closed)
+          continue;
+        tinyshell::v1::AgentStatusEvent e;
+        e.set_agent_id(id);
+        e.set_status(tinyshell::v1::AGENT_STATUS_CONNECTED);
+        e.set_timestamp_unix_ms(tsh::spine::now_unix_ms());
+        writer->Write(e);
+      }
+    }
+    auto watcher = std::make_shared<AgentWatcher>();
+    {
+      std::lock_guard<std::mutex> lk(watchers_mutex_);
+      watchers_.push_back(watcher);
+    }
+    tinyshell::v1::AgentStatusEvent event;
+    while (!context->IsCancelled() && !g_shutdown.load()) {
+      if (watcher->wait_pop(&event))
+        if (!writer->Write(event))
+          break;
+    }
+    watcher->close();
+    {
+      std::lock_guard<std::mutex> lk(watchers_mutex_);
+      watchers_.erase(std::remove(watchers_.begin(), watchers_.end(), watcher),
+                      watchers_.end());
+    }
+    return grpc::Status::OK;
+  }
+
   // ── AgentConnector ─────────────────────────────────────────────────────────
   grpc::Status Connect(
       grpc::ServerContext *,
@@ -286,6 +312,8 @@ public:
                           "agent_id is required");
     }
     store_->upsert_agent(first.hello());
+    notify_agent_watchers(agent_id, first.hello().hostname(),
+                          tinyshell::v1::AGENT_STATUS_CONNECTED);
 
     auto session = std::make_shared<AgentSession>();
     session->agent_id = agent_id;
@@ -308,6 +336,8 @@ public:
             if (msg.heartbeat().agent_id() == agent_id) {
               session->mark_heartbeat();
               store_->mark_agent_heartbeat(agent_id);
+              notify_agent_watchers(agent_id, "",
+                                    tinyshell::v1::AGENT_STATUS_HEARTBEAT);
             }
           }
         } catch (const std::exception &e) {
@@ -352,6 +382,8 @@ public:
     {
       std::lock_guard<std::mutex> lock(agents_mutex_);
       agents_.erase(agent_id);
+      notify_agent_watchers(agent_id, "",
+                            tinyshell::v1::AGENT_STATUS_DISCONNECTED);
     }
     std::cout << "[TinyShell Spine] agent disconnected: " << agent_id << "\n";
     return grpc::Status::OK;
@@ -360,6 +392,38 @@ public:
 private:
   // ── AgentSession
   // ────────────────────────────────────────────────────────────
+  struct AgentWatcher {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<tinyshell::v1::AgentStatusEvent> queue;
+    bool closed = false;
+
+    void push(const tinyshell::v1::AgentStatusEvent &e) {
+      {
+        std::lock_guard<std::mutex> lk(mutex);
+        queue.push_back(e);
+      }
+      cv.notify_one();
+    }
+    bool wait_pop(tinyshell::v1::AgentStatusEvent *out) {
+      std::unique_lock<std::mutex> lk(mutex);
+      cv.wait_for(lk, std::chrono::seconds(1),
+                  [&] { return closed || !queue.empty(); });
+      if (queue.empty())
+        return !closed;
+      *out = std::move(queue.front());
+      queue.pop_front();
+      return true;
+    }
+    void close() {
+      {
+        std::lock_guard<std::mutex> lk(mutex);
+        closed = true;
+      }
+      cv.notify_all();
+    }
+  };
+
   struct AgentSession {
     std::string agent_id;
     mutable std::mutex mutex;
@@ -452,6 +516,19 @@ private:
         session->close();
       }
     }
+  }
+
+  void notify_agent_watchers(const std::string &agent_id,
+                             const std::string &hostname,
+                             tinyshell::v1::AgentStatus status) {
+    tinyshell::v1::AgentStatusEvent e;
+    e.set_agent_id(agent_id);
+    e.set_hostname(hostname);
+    e.set_status(status);
+    e.set_timestamp_unix_ms(tsh::spine::now_unix_ms());
+    std::lock_guard<std::mutex> lk(watchers_mutex_);
+    for (auto &w : watchers_)
+      w->push(e);
   }
 
   // ── sequence helpers
@@ -604,19 +681,32 @@ private:
 
   tinyshell::v1::JobState current_state(const std::string &job_id) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    // FIX (eviction loop / Fix B): if this job was already fully evicted,
+    // do NOT re-insert it from the EventStore.  Returning UNSPECIFIED causes
+    // the caller to treat it as Unknown and drop the event without logging.
+    if (evicted_jobs_.count(job_id)) {
+      return tinyshell::v1::JOB_STATE_UNSPECIFIED;
+    }
     if (const auto it = lifecycle_.find(job_id); it != lifecycle_.end()) {
-      return it->second;
+      return it->second.state;
     }
     const auto stored =
         tsh::spine::job_state_from_name(store_->job_state(job_id));
-    lifecycle_[job_id] = stored;
+    lifecycle_[job_id] = LifecycleEntry{stored, {}};
     return stored;
   }
 
   void set_current_state(const std::string &job_id,
                          tinyshell::v1::JobState state) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-    lifecycle_[job_id] = state;
+    auto &entry = lifecycle_[job_id];
+    // FIX (eviction loop / Fix A): record the exact moment the job first
+    // enters a terminal state so evict_terminal_jobs() can enforce the TTL.
+    if (tsh::spine::is_terminal_state(state) &&
+        entry.terminal_since == std::chrono::steady_clock::time_point{}) {
+      entry.terminal_since = std::chrono::steady_clock::now();
+    }
+    entry.state = state;
   }
 
   void persist_and_publish(tinyshell::v1::JobEvent &event) {
@@ -692,14 +782,28 @@ private:
 
   void evict_terminal_jobs() {
     std::vector<std::string> to_evict;
+    const auto now = std::chrono::steady_clock::now();
 
-    // Identify terminal jobs under the lifecycle lock.
+    // FIX (eviction loop / Fix A): Only evict jobs that have been in a
+    // terminal state for longer than kTerminalJobTTLMs.  Previously there was
+    // no TTL check here at all — every terminal job was evicted on every
+    // monitor tick, causing the "evicted N terminal job(s)" log line to fire
+    // continuously even for the most recent completed job.
     {
       std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-      for (const auto &[id, state] : lifecycle_) {
-        if (tsh::spine::is_terminal_state(state)) {
+      for (const auto &[id, entry] : lifecycle_) {
+        if (!tsh::spine::is_terminal_state(entry.state))
+          continue;
+        // terminal_since is zero if set_current_state was never called (e.g.
+        // job was loaded from the store but never transitioned in this process
+        // lifetime). Treat those as "terminal since now" — they will age out
+        // on the next cycle after kTerminalJobTTLMs.
+        if (entry.terminal_since == std::chrono::steady_clock::time_point{})
+          continue;
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - entry.terminal_since);
+        if (age.count() >= kTerminalJobTTLMs)
           to_evict.push_back(id);
-        }
       }
     }
 
@@ -707,6 +811,9 @@ private:
       {
         std::lock_guard<std::mutex> lk(lifecycle_mutex_);
         lifecycle_.erase(id);
+        // FIX (eviction loop / Fix B): add to evicted set so current_state()
+        // never re-inserts this job from the EventStore after eviction.
+        evicted_jobs_.insert(id);
       }
       {
         std::lock_guard<std::mutex> lk(sequence_mutex_);
@@ -739,8 +846,34 @@ private:
   std::mutex sequence_mutex_;
   std::unordered_map<std::string, std::uint64_t> sequences_;
 
+  // ── BUG FIX (eviction loop): lifecycle_ previously stored only JobState with
+  // no timestamp, so the 1-hour TTL (kTerminalJobTTLMs) could never be checked.
+  // Every monitor cycle evicted ALL terminal jobs immediately, then
+  // current_state() re-inserted them from the EventStore on the next event,
+  // producing an infinite evict → re-insert → evict loop visible as the
+  // repeated log line:
+  //   "[TinyShell Spine] evicted 1 terminal job(s) from in-process maps"
+  //
+  // Fix A: Wrap JobState with a terminal_since timestamp.  Eviction now only
+  //        fires after kTerminalJobTTLMs has elapsed since the job went
+  //        terminal — matching the documented intent of the constant.
+  //
+  // Fix B: Add evicted_jobs_ set so current_state() never re-inserts a pruned
+  //        job back into lifecycle_ from the EventStore.  Without this guard,
+  //        even with the TTL fix a late-arriving agent event would resurrect
+  //        the entry and restart the eviction cycle.
+  struct LifecycleEntry {
+    tinyshell::v1::JobState state{tinyshell::v1::JOB_STATE_UNSPECIFIED};
+    // Populated the first time state transitions to a terminal value.
+    std::chrono::steady_clock::time_point terminal_since{};
+  };
+
   std::mutex lifecycle_mutex_;
-  std::unordered_map<std::string, tinyshell::v1::JobState> lifecycle_;
+  std::unordered_map<std::string, LifecycleEntry> lifecycle_;
+
+  // Jobs fully evicted from all in-process maps.  current_state() treats
+  // these as UNKNOWN so they are never re-inserted from the EventStore.
+  std::unordered_set<std::string> evicted_jobs_; // guarded by lifecycle_mutex_
 
   struct Assignment {
     std::string agent_id;
@@ -750,6 +883,8 @@ private:
   std::unordered_map<std::string, Assignment> assignments_;
 
   std::thread monitor_thread_;
+  std::mutex watchers_mutex_;
+  std::vector<std::shared_ptr<AgentWatcher>> watchers_;
 };
 
 void handle_signal(int) { g_shutdown.store(true); }
@@ -786,7 +921,7 @@ int main() {
     }
 
     tsh::spine::JobSigner signer(key_id, signing_secret);
-    auto store = tsh::spine::make_postgres_event_store(postgres_dsn);
+    auto store = tsh::spine::make_wal_event_store(postgres_dsn);
 
     SpineControlPlane service(std::move(signer), std::move(store));
 

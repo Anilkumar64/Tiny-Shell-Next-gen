@@ -1,15 +1,17 @@
 #pragma once
 #include "../common/Ast.h"
 #include "../common/ProcReader.h"
+// FIX (Bug 1): Removed <concepts> and <ranges> — both are C++20-only headers.
+// Neither was actually used in this file; the template constraint already uses
+// C++17 std::enable_if_t.  Including them caused a hard compile error under
+// -std=c++17.
 #include <array>
-#include <concepts>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
-#include <ranges>
 #include <set>
 #include <sstream>
 #include <stdexcept>

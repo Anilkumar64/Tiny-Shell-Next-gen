@@ -686,6 +686,35 @@ SSL_CTX *create_client_context() {
   return ctx;
 }
 
+// ── Process-level SSL_CTX cache (Bug Fix: TLS spam) ────────────────────────
+// create_server_context() and create_client_context() are expensive: they open
+// files, parse PEM data, and build verify stores.  They were called inside
+// SecureChannel::handshake(), meaning once per TCP connection.  When cert files
+// are missing this produced a log line on every connection attempt, including
+// the GUI poll loop firing ~2x/second.
+//
+// Fix: build each SSL_CTX exactly once using std::call_once and reuse it for
+// every subsequent connection.  SSL_CTX is internally thread-safe for
+// SSL_new(). If the cert files don\'t exist, the error logs once and nullptr is
+// cached; all subsequent handshakes fail fast (error 81) without any further
+// I/O or logging.
+static std::once_flag g_server_ctx_once;
+static std::once_flag g_client_ctx_once;
+static SSL_CTX *g_server_ctx = nullptr;
+static SSL_CTX *g_client_ctx = nullptr;
+
+SSL_CTX *get_server_context() {
+  std::call_once(g_server_ctx_once,
+                 [] { g_server_ctx = create_server_context(); });
+  return g_server_ctx;
+}
+
+SSL_CTX *get_client_context() {
+  std::call_once(g_client_ctx_once,
+                 [] { g_client_ctx = create_client_context(); });
+  return g_client_ctx;
+}
+
 struct ServerPins {
   std::vector<std::vector<unsigned char>> pubkey_der;
   std::vector<std::vector<unsigned char>> pubkey_sha256;
@@ -1207,15 +1236,19 @@ bool SecureChannel::handshake(Mode mode) {
   }
 
   tls_ = std::make_unique<TlsState>();
-  tls_->ctx =
-      mode == Mode::SERVER ? create_server_context() : create_client_context();
-  if (!tls_->ctx) {
+  // FIX (TLS spam): use the process-level cached SSL_CTX instead of building a
+  // new one per connection.  See get_server_context() / get_client_context().
+  // We do NOT take ownership here — the global owns the ctx lifetime.
+  tls_->ctx = nullptr; // owned by the global cache; set ssl only
+  SSL_CTX *ctx =
+      mode == Mode::SERVER ? get_server_context() : get_client_context();
+  if (!ctx) {
     set_error(81);
     tls_.reset();
     return false;
   }
 
-  tls_->ssl = SSL_new(tls_->ctx);
+  tls_->ssl = SSL_new(ctx);
   if (!tls_->ssl || SSL_set_fd(tls_->ssl, fd) != 1) {
     set_error(82);
     tls_.reset();

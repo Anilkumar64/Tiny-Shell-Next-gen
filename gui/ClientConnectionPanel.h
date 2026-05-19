@@ -1,5 +1,7 @@
 #pragma once
 #include "ApiClient.h"
+#include <QDateTime>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -8,6 +10,7 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <utility>
 
 // Live panel showing all connected client sessions
 class ClientConnectionPanel : public QWidget {
@@ -21,7 +24,8 @@ public:
 
 private slots:
   void pollClients() {
-    m_api->getText("/control/events", [this](QString body, QString err) {
+    m_api->getText(QString("/control/events?since_sequence=%1").arg(m_lastSeq),
+                   [this](QString body, QString err) {
       if (!err.isEmpty()) {
         m_statusLbl->setText("⚠ Connection offline");
         return;
@@ -31,43 +35,58 @@ private slots:
       if (pe.error != QJsonParseError::NoError)
         return;
 
-      // Extract unique clients from events
-      QSet<QString> clients;
       const auto events = doc.object().value("events").toArray();
       for (const auto &evt : events) {
         const auto obj = evt.toObject();
+        const auto seq = static_cast<quint64>(obj.value("sequence").toDouble());
+        if (seq > m_lastSeq)
+          m_lastSeq = seq;
+
         const auto user = obj.value("user").toString();
         const auto ip = obj.value("client_ip").toString();
         if (!user.isEmpty() && !ip.isEmpty()) {
-          clients.insert(user + ":" + ip);
+          const auto key = user + "\n" + ip;
+          auto &client = m_clients[key];
+          client.user = user;
+          client.tenant = obj.value("tenant").toString("default");
+          client.ip = ip;
+          client.lastSeen = QDateTime::currentDateTime().toString("hh:mm:ss");
+          if (client.connectedSince.isEmpty())
+            client.connectedSince = client.lastSeen;
         }
       }
 
-      m_table->setRowCount(0);
-      int row = 0;
-      for (const auto &client : clients) {
-        m_table->insertRow(row);
-        const auto parts = client.split(":");
-        m_table->setItem(
-            row, 0, new QTableWidgetItem(parts.size() > 0 ? parts[0] : ""));
-        m_table->setItem(row, 1, new QTableWidgetItem("default"));
-        m_table->setItem(
-            row, 2, new QTableWidgetItem(parts.size() > 1 ? parts[1] : ""));
-        m_table->setItem(row, 3, new QTableWidgetItem("●"));
-        m_table->setItem(row, 4, new QTableWidgetItem("🔒 X25519+AES256-GCM"));
-        m_table->setItem(
-            row, 5,
-            new QTableWidgetItem(
-                QDateTime::currentDateTime().toString("hh:mm:ss")));
-        row++;
-      }
-
-      m_statusLbl->setText("● Online · " + QString::number(clients.size()) +
-                           " clients");
+      renderClients();
     });
   }
 
 private:
+  struct ClientRow {
+    QString user;
+    QString tenant;
+    QString ip;
+    QString connectedSince;
+    QString lastSeen;
+  };
+
+  void renderClients() {
+      m_table->setRowCount(0);
+      int row = 0;
+      for (const auto &client : std::as_const(m_clients)) {
+        m_table->insertRow(row);
+        m_table->setItem(row, 0, new QTableWidgetItem(client.user));
+        m_table->setItem(row, 1, new QTableWidgetItem(client.tenant));
+        m_table->setItem(row, 2, new QTableWidgetItem(client.ip));
+        m_table->setItem(row, 3, new QTableWidgetItem("●"));
+        m_table->setItem(row, 4, new QTableWidgetItem("🔒 X25519+AES256-GCM"));
+        m_table->setItem(row, 5, new QTableWidgetItem(client.connectedSince));
+        row++;
+      }
+
+      m_statusLbl->setText("● Online · " + QString::number(m_clients.size()) +
+                           " clients");
+  }
+
   void buildUI() {
     auto *root = new QVBoxLayout(this);
     root->setContentsMargins(28, 24, 28, 20);
@@ -109,4 +128,6 @@ private:
   tsh::ApiClient *m_api = nullptr;
   QTableWidget *m_table = nullptr;
   QLabel *m_statusLbl = nullptr;
+  quint64 m_lastSeq = 0;
+  QHash<QString, ClientRow> m_clients;
 };

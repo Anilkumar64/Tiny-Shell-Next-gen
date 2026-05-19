@@ -1,5 +1,8 @@
 #pragma once
 #include "ApiClient.h"
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QProgressBar>
 #include <QTableWidget>
@@ -19,7 +22,8 @@ public:
 
 private slots:
   void pollJobs() {
-    m_api->getText("/control/events", [this](QString body, QString err) {
+    m_api->getText(QString("/control/events?since_sequence=%1").arg(m_lastSeq),
+                   [this](QString body, QString err) {
       if (!err.isEmpty()) {
         m_statusLbl->setText("⚠ Stream offline");
         return;
@@ -30,8 +34,18 @@ private slots:
         return;
 
       const auto events = doc.object().value("events").toArray();
-      updateJobStats(events);
-      updateJobTable(events);
+      for (const auto &value : events) {
+        const auto obj = value.toObject();
+        const auto seq = static_cast<quint64>(obj.value("sequence").toDouble());
+        if (seq <= m_lastSeq)
+          continue;
+        m_lastSeq = seq;
+        m_events.append(obj);
+      }
+      while (m_events.size() > 1000)
+        m_events.removeAt(0);
+      updateJobStats(m_events);
+      updateJobTable(m_events);
     });
   }
 
@@ -144,4 +158,6 @@ private:
   tsh::ApiClient *m_api = nullptr;
   QTableWidget *m_table = nullptr;
   QLabel *m_statusLbl = nullptr;
+  quint64 m_lastSeq = 0;
+  QJsonArray m_events;
 };

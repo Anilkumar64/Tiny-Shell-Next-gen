@@ -38,6 +38,7 @@
 #include "Uuid.h"
 #include "tinyshell/v1/spine.grpc.pb.h"
 
+#include "../../config/tsh_config.h"
 #include <grpcpp/grpcpp.h>
 
 #include <fcntl.h>
@@ -551,10 +552,14 @@ private:
           continue;
       }
       const auto job_id = signed_spec.spec().job_id();
-      emit_event(job_id, tinyshell::v1::JOB_LOST, [&](auto *ev) {
-        ev->set_message("agent recovered an unfinished "
-                        "local execution journal entry");
-      });
+      // FIX (Bug 4): emit_event's callback is std::function<void(JobEvent &)>
+      // — a reference, not a pointer.  The original lambda took auto *ev and
+      // used -> which caused a compile error.  Changed to auto &ev and ..
+      emit_event(job_id, tinyshell::v1::JOB_LOST,
+                 [&](tinyshell::v1::JobEvent &ev) {
+                   ev.set_message("agent recovered an unfinished "
+                                  "local execution journal entry");
+                 });
       journal_finished(job_id);
     }
   }
@@ -705,7 +710,10 @@ int main() {
         env_string("TSH_AGENT_CONNECT_TARGET",
                    env_string("TSH_SPINE_TARGET", "127.0.0.1:7444"));
     const auto agent_id = env_string("TSH_AGENT_ID", "agent-local-1");
-    const auto signing_secret = env_string("TSH_JOB_SIGNING_KEY");
+    const auto signing_secret =
+        tsh::Config::read_string("TSH_JOB_SIGNING_KEY", "");
+    if (signing_secret.empty())
+      throw std::runtime_error("TSH_JOB_SIGNING_KEY is required");
     const auto key_id = env_string("TSH_JOB_KEY_ID", "local-hmac-v1");
     const auto default_state_dir = env_string("HOME", "/tmp") +
                                    "/.local/state/tinyshell/agent-" + agent_id;

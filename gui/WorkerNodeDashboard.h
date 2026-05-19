@@ -19,7 +19,7 @@ public:
 
 private slots:
   void pollWorkers() {
-    m_api->getText("/control/events", [this](QString body, QString err) {
+    m_api->getText("/control/workers", [this](QString body, QString err) {
       if (!err.isEmpty()) {
         m_statusLbl->setText("⚠ Stream offline");
         return;

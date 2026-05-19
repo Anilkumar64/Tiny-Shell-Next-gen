@@ -571,12 +571,12 @@ private:
 
 } // namespace
 
-std::unique_ptr<EventStore> make_postgres_event_store(const std::string &dsn) {
+std::unique_ptr<EventStore> make_wal_event_store(const std::string &data_dir) {
   std::filesystem::path dir;
-  if (dsn.rfind("file://", 0) == 0) {
-    dir = dsn.substr(7);
-  } else if (!dsn.empty()) {
-    dir = dsn;
+  if (data_dir.rfind("file://", 0) == 0) {
+    dir = data_dir.substr(7);
+  } else if (!data_dir.empty()) {
+    dir = data_dir;
   } else {
     dir = default_store_dir();
   }
